@@ -140,3 +140,20 @@ print(f"Emojis mapped       : {log['emojis']}")
 print(f"Negations retained  : {log['negations']}")
 print(f"Avg len before      : {sum(log['len_before'])/len(log['len_before']):.2f}")
 print(f"Avg len after       : {sum(log['len_after'])/len(log['len_after']):.2f}")
+
+
+from utils_logger import update_log
+
+original_count = len(train) + len(valid) + len(test)
+cleaned_count = len(df)
+
+update_log("Step1_Cleaning", {
+    "dataset_name": "LIAR",
+    "total_samples": cleaned_count,
+    "duplicates_removed": original_count - cleaned_count,
+    "urls_replaced": log["urls"],
+    "emojis_mapped": log["emojis"],
+    "negations_retained": log["negations"],
+    "avg_len_before": round(sum(log["len_before"]) / len(log["len_before"]), 2),
+    "avg_len_after": round(sum(log["len_after"]) / len(log["len_after"]), 2)
+})
