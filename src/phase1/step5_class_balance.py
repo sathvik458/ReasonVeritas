@@ -1,17 +1,20 @@
 import pandas as pd
 import os
+import sys
 import numpy as np
 from sklearn.utils.class_weight import compute_class_weight
+
+_src = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, _src)
 from utils_logger import update_log
+from config import DATA_DIR, MAX_SEQUENCE_LEN
 
 
 # -----------------------------
 # LOAD DATA (AFTER STEP-4)
 # -----------------------------
 
-BASE_DIR = os.path.dirname(os.path.dirname(__file__))
-input_path = os.path.join(BASE_DIR, "data", "liar_truncated_L128.csv")
-
+input_path = os.path.join(DATA_DIR, f"liar_truncated_L{MAX_SEQUENCE_LEN}.csv")
 df = pd.read_csv(input_path)
 
 
@@ -70,7 +73,8 @@ print(class_weights)
 # SAVE WEIGHTS
 # -----------------------------
 
-weights_path = os.path.join(BASE_DIR, "data", "class_weights.txt")
+os.makedirs(DATA_DIR, exist_ok=True)
+weights_path = os.path.join(DATA_DIR, "class_weights.txt")
 with open(weights_path, "w") as f:
     for k, v in class_weights.items():
         f.write(f"{k}: {float(v)}\n")

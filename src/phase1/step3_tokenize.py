@@ -1,16 +1,19 @@
 import pandas as pd
 import spacy
 import os
+import sys
+
+_src = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, _src)
 from utils_logger import update_log
+from config import DATA_DIR
 
 
 # -----------------------------
 # LOAD NORMALIZED DATA (STEP-2)
 # -----------------------------
 
-BASE_DIR = os.path.dirname(os.path.dirname(__file__))
-input_path = os.path.join(BASE_DIR, "data", "liar_normalized_step2.csv")
-
+input_path = os.path.join(DATA_DIR, "liar_normalized_step2.csv")
 df = pd.read_csv(input_path)
 
 
@@ -75,7 +78,8 @@ avg_tokens = log["total_tokens"] / len(df)
 # SAVE OUTPUT
 # -----------------------------
 
-output_path = os.path.join(BASE_DIR, "data", "liar_tokenized_step3.csv")
+os.makedirs(DATA_DIR, exist_ok=True)
+output_path = os.path.join(DATA_DIR, "liar_tokenized_step3.csv")
 df.to_csv(output_path, index=False)
 
 

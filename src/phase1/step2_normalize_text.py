@@ -3,16 +3,19 @@ import re
 import unicodedata
 import contractions
 import os
+import sys
+
+_src = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, _src)
 from utils_logger import update_log
+from config import DATA_DIR
 
 
 # -----------------------------
 # LOAD STEP-1 OUTPUT
 # -----------------------------
 
-BASE_DIR = os.path.dirname(os.path.dirname(__file__))
-input_path = os.path.join(BASE_DIR, "data", "liar_cleaned_step1.csv")
-
+input_path = os.path.join(DATA_DIR, "liar_cleaned_step1.csv")
 df = pd.read_csv(input_path)
 
 
@@ -74,7 +77,8 @@ df["normalized_text"] = df["clean_statement"].apply(normalize_text)
 # SAVE STEP-2 OUTPUT
 # -----------------------------
 
-output_path = os.path.join(BASE_DIR, "data", "liar_normalized_step2.csv")
+os.makedirs(DATA_DIR, exist_ok=True)
+output_path = os.path.join(DATA_DIR, "liar_normalized_step2.csv")
 df.to_csv(output_path, index=False)
 
 

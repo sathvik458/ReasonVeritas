@@ -5,19 +5,18 @@ import emoji
 import contractions
 from bs4 import BeautifulSoup
 import os
+import sys
 
-
+_src = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, _src)
+from config import LIAR_DATASET_DIR, DATA_DIR
 
 # LOAD DATA
 
-
-# Get the main project directory (one level above src folder)
-BASE_DIR = os.path.dirname(os.path.dirname(__file__))
-
-# Create full paths to dataset files inside the "data" folder
-train_path = os.path.join(BASE_DIR, "data", "train.tsv")
-valid_path = os.path.join(BASE_DIR, "data", "valid.tsv")
-test_path  = os.path.join(BASE_DIR, "data", "test.tsv")
+# Raw dataset from config path; outputs go to project data folder
+train_path = os.path.join(LIAR_DATASET_DIR, "train.tsv")
+valid_path = os.path.join(LIAR_DATASET_DIR, "valid.tsv")
+test_path  = os.path.join(LIAR_DATASET_DIR, "test.tsv")
 
 # LIAR dataset does not contain column headers,
 # so we use header=None to load it correctly
@@ -126,7 +125,8 @@ df = df.drop_duplicates(subset="clean_statement")
 
 
 # Save cleaned dataset inside data folder
-output_path = os.path.join(BASE_DIR, "data", "liar_cleaned_step1.csv")
+os.makedirs(DATA_DIR, exist_ok=True)
+output_path = os.path.join(DATA_DIR, "liar_cleaned_step1.csv")
 df.to_csv(output_path, index=False)
 
 

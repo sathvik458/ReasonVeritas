@@ -8,8 +8,8 @@
         "negations_retained": 2120,
         "avg_len_before": 18.04,
         "avg_len_after": 18.3,
-        "timestamp": "2026-02-08 12:30:09",
-        "python_version": "3.12.4"
+        "timestamp": "2026-02-15 19:59:16",
+        "python_version": "3.11.9"
     },
     "Step2_Normalization": {
         "dataset_name": "LIAR",
@@ -18,8 +18,8 @@
         "numbers_normalized": 8932,
         "avg_len_before": 18.31,
         "avg_len_after": 18.31,
-        "timestamp": "2026-02-08 14:26:17",
-        "python_version": "3.12.4"
+        "timestamp": "2026-02-15 19:59:17",
+        "python_version": "3.11.9"
     },
     "Step3_Tokenization": {
         "dataset_name": "LIAR",
@@ -28,18 +28,18 @@
         "avg_tokens_per_sentence": 22.21,
         "punctuation_tokens": 28981,
         "negation_tokens": 2390,
-        "timestamp": "2026-02-08 14:30:05",
-        "python_version": "3.12.4"
+        "timestamp": "2026-02-15 20:00:29",
+        "python_version": "3.11.9"
     },
     "Step4_SequenceLengthHandling": {
         "dataset_name": "LIAR",
         "total_samples": 12765,
-        "max_sequence_length": 32,
+        "max_sequence_length": 128,
         "original_avg_length": 22.21,
-        "truncated_avg_length": 20.97,
-        "num_truncated_samples": 1725,
-        "timestamp": "2026-02-08 14:33:37",
-        "python_version": "3.12.4"
+        "truncated_avg_length": 22.04,
+        "num_truncated_samples": 6,
+        "timestamp": "2026-02-14 23:38:10",
+        "python_version": "3.11.9"
     },
     "Step5_ClassBalance": {
         "dataset_name": "LIAR",
@@ -60,8 +60,8 @@
             "real": 0.8960409939632178,
             "fake": 1.1312477844735909
         },
-        "timestamp": "2026-02-08 14:35:48",
-        "python_version": "3.12.4"
+        "timestamp": "2026-02-15 20:00:45",
+        "python_version": "3.11.9"
     },
     "Step6_ConceptMapping": {
         "dataset_name": "LIAR",
@@ -73,8 +73,8 @@
         "emotion_ratio": 0.0001,
         "modality_ratio": 0.0041,
         "negation_ratio": 0.0085,
-        "timestamp": "2026-02-08 14:38:56",
-        "python_version": "3.12.4"
+        "timestamp": "2026-02-14 23:38:55",
+        "python_version": "3.11.9"
     },
     "Step7_DatasetSplit": {
         "dataset_name": "LIAR",
@@ -96,8 +96,8 @@
         },
         "random_seed": 42,
         "split_ratio": "70-15-15 (stratified)",
-        "timestamp": "2026-02-08 14:41:15",
-        "python_version": "3.12.4"
+        "timestamp": "2026-02-14 23:39:05",
+        "python_version": "3.11.9"
     },
     "Step8_EvaluationVariants": {
         "dataset_name": "LIAR",
@@ -106,7 +106,175 @@
         "avg_comprehensiveness_length": 21.76,
         "samples_with_no_concepts": 6836,
         "evaluation_type": "Sufficiency & Comprehensiveness",
-        "timestamp": "2026-02-08 14:43:18",
-        "python_version": "3.12.4"
+        "timestamp": "2026-02-14 23:39:12",
+        "python_version": "3.11.9"
+    },
+    "Step4_SequenceLengthHandling_L128": {
+        "dataset_name": "LIAR",
+        "total_samples": 12765,
+        "max_sequence_length": 128,
+        "original_avg_length": 22.21,
+        "truncated_avg_length": 22.04,
+        "num_truncated_samples": 6,
+        "timestamp": "2026-02-15 20:00:31",
+        "python_version": "3.11.9"
+    },
+    "Step4_SequenceLengthHandling_L256": {
+        "dataset_name": "LIAR",
+        "total_samples": 12765,
+        "max_sequence_length": 256,
+        "original_avg_length": 22.21,
+        "truncated_avg_length": 22.09,
+        "num_truncated_samples": 5,
+        "timestamp": "2026-02-15 20:00:31",
+        "python_version": "3.11.9"
+    },
+    "Step4_SequenceLengthHandling_L512": {
+        "dataset_name": "LIAR",
+        "total_samples": 12765,
+        "max_sequence_length": 512,
+        "original_avg_length": 22.21,
+        "truncated_avg_length": 22.16,
+        "num_truncated_samples": 3,
+        "timestamp": "2026-02-15 20:00:31",
+        "python_version": "3.11.9"
+    },
+    "Step6_ConceptMapping_L128": {
+        "dataset_name": "LIAR",
+        "total_samples": 12765,
+        "total_tokens": 281286,
+        "emotion_tokens": 41,
+        "modality_tokens": 1157,
+        "negation_tokens": 2381,
+        "emotion_ratio": 0.0001,
+        "modality_ratio": 0.0041,
+        "negation_ratio": 0.0085,
+        "timestamp": "2026-02-15 20:00:47",
+        "python_version": "3.11.9"
+    },
+    "Step6_ConceptMapping_L256": {
+        "dataset_name": "LIAR",
+        "total_samples": 12765,
+        "total_tokens": 281929,
+        "emotion_tokens": 41,
+        "modality_tokens": 1157,
+        "negation_tokens": 2386,
+        "emotion_ratio": 0.0001,
+        "modality_ratio": 0.0041,
+        "negation_ratio": 0.0085,
+        "timestamp": "2026-02-15 20:00:48",
+        "python_version": "3.11.9"
+    },
+    "Step6_ConceptMapping_L512": {
+        "dataset_name": "LIAR",
+        "total_samples": 12765,
+        "total_tokens": 282926,
+        "emotion_tokens": 41,
+        "modality_tokens": 1159,
+        "negation_tokens": 2390,
+        "emotion_ratio": 0.0001,
+        "modality_ratio": 0.0041,
+        "negation_ratio": 0.0084,
+        "timestamp": "2026-02-15 20:00:49",
+        "python_version": "3.11.9"
+    },
+    "Step7_DatasetSplit_L128": {
+        "dataset_name": "LIAR",
+        "total_samples": 12765,
+        "train_size": 8935,
+        "validation_size": 1915,
+        "test_size": 1915,
+        "train_distribution": {
+            "real": 4986,
+            "fake": 3949
+        },
+        "validation_distribution": {
+            "real": 1069,
+            "fake": 846
+        },
+        "test_distribution": {
+            "real": 1068,
+            "fake": 847
+        },
+        "random_seed": 42,
+        "split_ratio": "70-15-15 (stratified)",
+        "timestamp": "2026-02-15 20:00:52",
+        "python_version": "3.11.9"
+    },
+    "Step7_DatasetSplit_L256": {
+        "dataset_name": "LIAR",
+        "total_samples": 12765,
+        "train_size": 8935,
+        "validation_size": 1915,
+        "test_size": 1915,
+        "train_distribution": {
+            "real": 4986,
+            "fake": 3949
+        },
+        "validation_distribution": {
+            "real": 1069,
+            "fake": 846
+        },
+        "test_distribution": {
+            "real": 1068,
+            "fake": 847
+        },
+        "random_seed": 42,
+        "split_ratio": "70-15-15 (stratified)",
+        "timestamp": "2026-02-15 20:00:52",
+        "python_version": "3.11.9"
+    },
+    "Step7_DatasetSplit_L512": {
+        "dataset_name": "LIAR",
+        "total_samples": 12765,
+        "train_size": 8935,
+        "validation_size": 1915,
+        "test_size": 1915,
+        "train_distribution": {
+            "real": 4986,
+            "fake": 3949
+        },
+        "validation_distribution": {
+            "real": 1069,
+            "fake": 846
+        },
+        "test_distribution": {
+            "real": 1068,
+            "fake": 847
+        },
+        "random_seed": 42,
+        "split_ratio": "70-15-15 (stratified)",
+        "timestamp": "2026-02-15 20:00:52",
+        "python_version": "3.11.9"
+    },
+    "Step8_EvaluationVariants_L128": {
+        "dataset_name": "LIAR",
+        "total_samples": 8935,
+        "avg_sufficiency_length": 0.28,
+        "avg_comprehensiveness_length": 21.76,
+        "samples_with_no_concepts": 6836,
+        "evaluation_type": "Sufficiency & Comprehensiveness",
+        "timestamp": "2026-02-15 20:00:54",
+        "python_version": "3.11.9"
+    },
+    "Step8_EvaluationVariants_L256": {
+        "dataset_name": "LIAR",
+        "total_samples": 8935,
+        "avg_sufficiency_length": 0.28,
+        "avg_comprehensiveness_length": 21.79,
+        "samples_with_no_concepts": 6835,
+        "evaluation_type": "Sufficiency & Comprehensiveness",
+        "timestamp": "2026-02-15 20:00:55",
+        "python_version": "3.11.9"
+    },
+    "Step8_EvaluationVariants_L512": {
+        "dataset_name": "LIAR",
+        "total_samples": 8935,
+        "avg_sufficiency_length": 0.28,
+        "avg_comprehensiveness_length": 21.82,
+        "samples_with_no_concepts": 6835,
+        "evaluation_type": "Sufficiency & Comprehensiveness",
+        "timestamp": "2026-02-15 20:00:56",
+        "python_version": "3.11.9"
     }
 }
