@@ -5,7 +5,8 @@ Adjust LIAR_DATASET_DIR if the raw data lives elsewhere.
 import os
 
 # Raw Liar dataset directory (train.tsv, valid.tsv, test.tsv)
-LIAR_DATASET_DIR = r"C:\Users\hkanv\Downloads\liar_dataset"
+# NOTE Keep your dataset path here 
+LIAR_DATASET_DIR = r"C:\Users\lohan\Downloads\liar_dataset"  
 
 # Project data directory for pipeline outputs (default: project/data)
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
