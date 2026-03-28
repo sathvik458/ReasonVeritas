@@ -8,7 +8,7 @@
         "negations_retained": 2120,
         "avg_len_before": 18.04,
         "avg_len_after": 18.3,
-        "timestamp": "2026-03-27 20:48:45",
+        "timestamp": "2026-03-27 22:22:24",
         "python_version": "3.13.7"
     },
     "Step2_Normalization": {
@@ -18,7 +18,7 @@
         "numbers_normalized": 8932,
         "avg_len_before": 18.31,
         "avg_len_after": 18.31,
-        "timestamp": "2026-03-27 20:48:47",
+        "timestamp": "2026-03-27 22:22:27",
         "python_version": "3.13.7"
     },
     "Step3_Tokenization": {
@@ -28,7 +28,7 @@
         "avg_tokens_per_sentence": 22.21,
         "punctuation_tokens": 28981,
         "negation_tokens": 2390,
-        "timestamp": "2026-03-27 20:50:09",
+        "timestamp": "2026-03-27 22:23:50",
         "python_version": "3.13.7"
     },
     "Step4_SequenceLengthHandling": {
@@ -60,7 +60,7 @@
             "real": 0.8960409939632178,
             "fake": 1.1312477844735909
         },
-        "timestamp": "2026-03-27 20:50:26",
+        "timestamp": "2026-03-27 22:24:00",
         "python_version": "3.13.7"
     },
     "Step6_ConceptMapping": {
@@ -116,7 +116,7 @@
         "original_avg_length": 22.21,
         "truncated_avg_length": 22.04,
         "num_truncated_samples": 6,
-        "timestamp": "2026-03-27 20:50:13",
+        "timestamp": "2026-03-27 22:23:54",
         "python_version": "3.13.7"
     },
     "Step4_SequenceLengthHandling_L256": {
@@ -126,7 +126,7 @@
         "original_avg_length": 22.21,
         "truncated_avg_length": 22.09,
         "num_truncated_samples": 5,
-        "timestamp": "2026-03-27 20:50:13",
+        "timestamp": "2026-03-27 22:23:55",
         "python_version": "3.13.7"
     },
     "Step4_SequenceLengthHandling_L512": {
@@ -136,7 +136,7 @@
         "original_avg_length": 22.21,
         "truncated_avg_length": 22.16,
         "num_truncated_samples": 3,
-        "timestamp": "2026-03-27 20:50:14",
+        "timestamp": "2026-03-27 22:23:55",
         "python_version": "3.13.7"
     },
     "Step6_ConceptMapping_L128": {
@@ -149,7 +149,7 @@
         "emotion_ratio": 0.0001,
         "modality_ratio": 0.0041,
         "negation_ratio": 0.0085,
-        "timestamp": "2026-03-27 20:50:30",
+        "timestamp": "2026-03-27 22:24:04",
         "python_version": "3.13.7"
     },
     "Step6_ConceptMapping_L256": {
@@ -162,7 +162,7 @@
         "emotion_ratio": 0.0001,
         "modality_ratio": 0.0041,
         "negation_ratio": 0.0085,
-        "timestamp": "2026-03-27 20:50:32",
+        "timestamp": "2026-03-27 22:24:06",
         "python_version": "3.13.7"
     },
     "Step6_ConceptMapping_L512": {
@@ -175,7 +175,7 @@
         "emotion_ratio": 0.0001,
         "modality_ratio": 0.0041,
         "negation_ratio": 0.0084,
-        "timestamp": "2026-03-27 20:50:33",
+        "timestamp": "2026-03-27 22:24:07",
         "python_version": "3.13.7"
     },
     "Step7_DatasetSplit_L128": {
@@ -198,7 +198,7 @@
         },
         "random_seed": 42,
         "split_ratio": "70-15-15 (stratified)",
-        "timestamp": "2026-03-27 20:50:39",
+        "timestamp": "2026-03-27 22:24:12",
         "python_version": "3.13.7"
     },
     "Step7_DatasetSplit_L256": {
@@ -221,7 +221,7 @@
         },
         "random_seed": 42,
         "split_ratio": "70-15-15 (stratified)",
-        "timestamp": "2026-03-27 20:50:40",
+        "timestamp": "2026-03-27 22:24:13",
         "python_version": "3.13.7"
     },
     "Step7_DatasetSplit_L512": {
@@ -244,7 +244,7 @@
         },
         "random_seed": 42,
         "split_ratio": "70-15-15 (stratified)",
-        "timestamp": "2026-03-27 20:50:41",
+        "timestamp": "2026-03-27 22:24:13",
         "python_version": "3.13.7"
     },
     "Step8_EvaluationVariants_L128": {
@@ -254,7 +254,7 @@
         "avg_comprehensiveness_length": 21.76,
         "samples_with_no_concepts": 6836,
         "evaluation_type": "Sufficiency & Comprehensiveness",
-        "timestamp": "2026-03-27 20:50:44",
+        "timestamp": "2026-03-27 22:24:17",
         "python_version": "3.13.7"
     },
     "Step8_EvaluationVariants_L256": {
@@ -264,7 +264,7 @@
         "avg_comprehensiveness_length": 21.79,
         "samples_with_no_concepts": 6835,
         "evaluation_type": "Sufficiency & Comprehensiveness",
-        "timestamp": "2026-03-27 20:50:47",
+        "timestamp": "2026-03-27 22:24:20",
         "python_version": "3.13.7"
     },
     "Step8_EvaluationVariants_L512": {
@@ -274,7 +274,7 @@
         "avg_comprehensiveness_length": 21.82,
         "samples_with_no_concepts": 6835,
         "evaluation_type": "Sufficiency & Comprehensiveness",
-        "timestamp": "2026-03-27 20:50:49",
+        "timestamp": "2026-03-27 22:24:22",
         "python_version": "3.13.7"
     }
 }
