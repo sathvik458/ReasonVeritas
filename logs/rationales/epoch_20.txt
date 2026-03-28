@@ -1,0 +1,32 @@
+=== Epoch 20 — Sample Rationales ===
+
+--- Example 1 ---
+Step 1 [Emotion]:   score 0.00 → low     — minimal emotional language — claim is relatively neutral
+Step 2 [Modality]:  score 0.00 → low     — claim is mostly direct and assertive — low hedging
+Step 3 [Negation]:  score 0.39 → medium  — some negation present — partial contradictions
+─────────────────────────────────────────────
+Verdict:     FAKE
+Confidence:  99.9%
+─────────────────────────────────────────────
+Reasoning: No dominant concept signals found, but the overall linguistic pattern matches fake news characteristics in the training data.
+
+--- Example 2 ---
+Step 1 [Emotion]:   score 0.00 → low     — minimal emotional language — claim is relatively neutral
+Step 2 [Modality]:  score 0.91 → HIGH    — heavy use of hedging words (may/might/could) — claim avoids commitment
+Step 3 [Negation]:  score 0.44 → medium  — some negation present — partial contradictions
+─────────────────────────────────────────────
+Verdict:     FAKE
+Confidence:  63.1%
+─────────────────────────────────────────────
+Reasoning: This claim contains hedging language, which are common indicators of misleading content.
+
+--- Example 3 ---
+Step 1 [Emotion]:   score 0.00 → low     — minimal emotional language — claim is relatively neutral
+Step 2 [Modality]:  score 0.00 → low     — claim is mostly direct and assertive — low hedging
+Step 3 [Negation]:  score 0.52 → medium  — some negation present — partial contradictions
+─────────────────────────────────────────────
+Verdict:     FAKE
+Confidence:  96.3%
+─────────────────────────────────────────────
+Reasoning: No dominant concept signals found, but the overall linguistic pattern matches fake news characteristics in the training data.
+
