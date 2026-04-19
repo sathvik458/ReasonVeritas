@@ -3,4 +3,4 @@ __pycache__/
 *.pyc
 data/
 
-gpu_env/
+gpu_env/.DS_Store
