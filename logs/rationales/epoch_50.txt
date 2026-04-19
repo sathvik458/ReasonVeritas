@@ -3,17 +3,17 @@
 --- Example 1 ---
 Step 1 [Emotion]:   score 0.00 → low     — minimal emotional language — claim is relatively neutral
 Step 2 [Modality]:  score 0.00 → low     — claim is mostly direct and assertive — low hedging
-Step 3 [Negation]:  score 0.16 → low     — little to no negation — claim is largely positive
+Step 3 [Negation]:  score 0.49 → medium  — some negation present — partial contradictions
 ─────────────────────────────────────────────
-Verdict:     FAKE
+Verdict:     REAL
 Confidence:  100.0%
 ─────────────────────────────────────────────
-Reasoning: No dominant concept signals found, but the overall linguistic pattern matches fake news characteristics in the training data.
+Reasoning: The claim shows neutral linguistic patterns consistent with factual reporting.
 
 --- Example 2 ---
 Step 1 [Emotion]:   score 0.00 → low     — minimal emotional language — claim is relatively neutral
-Step 2 [Modality]:  score 0.85 → HIGH    — heavy use of hedging words (may/might/could) — claim avoids commitment
-Step 3 [Negation]:  score 0.17 → low     — little to no negation — claim is largely positive
+Step 2 [Modality]:  score 0.58 → HIGH    — heavy use of hedging words (may/might/could) — claim avoids commitment
+Step 3 [Negation]:  score 0.28 → low     — little to no negation — claim is largely positive
 ─────────────────────────────────────────────
 Verdict:     FAKE
 Confidence:  100.0%
@@ -23,10 +23,10 @@ Reasoning: This claim contains hedging language, which are common indicators of 
 --- Example 3 ---
 Step 1 [Emotion]:   score 0.00 → low     — minimal emotional language — claim is relatively neutral
 Step 2 [Modality]:  score 0.00 → low     — claim is mostly direct and assertive — low hedging
-Step 3 [Negation]:  score 0.37 → medium  — some negation present — partial contradictions
+Step 3 [Negation]:  score 0.33 → medium  — some negation present — partial contradictions
 ─────────────────────────────────────────────
 Verdict:     FAKE
-Confidence:  100.0%
+Confidence:  99.9%
 ─────────────────────────────────────────────
 Reasoning: No dominant concept signals found, but the overall linguistic pattern matches fake news characteristics in the training data.
 

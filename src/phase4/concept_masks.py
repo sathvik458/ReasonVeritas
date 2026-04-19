@@ -1,107 +1,159 @@
 """
-phase4/concept_masks.py
+phase4/concept_masks.py  — REWORKED for BERT-subword alignment
 
-Reads concept_tags from the Phase 1 CSV and builds binary masks
-for each concept type: EMOTION, MODALITY, NEGATION.
+Projects word-level concept tags (from Phase 1 step6) onto subword positions
+(from the cached DistilBERT features in Phase 2 step3). Each split produces
+three (N, T) float masks (T = BERT_MAX_LEN), aligned 1:1 with the features
+file so Phase 4 training can do a simple dataset zip.
 
-Each mask is a list of 0s and 1s, same length as the token list.
-A 1 means that token is tagged with that concept.
+Tag set produced by Phase 1 step6:
+    O, EMOTION, MODALITY, MODALITY_SCOPE, NEGATION, NEGATION_SCOPE
 
-Example:
-  tokens       = ["the", "president", "never", "signed", "crisis"]
-  concept_tags = ["O",   "O",         "NEGATION", "O",   "EMOTION"]
+Collapsed to 3 concept channels here:
+    EMOTION  channel : {EMOTION}
+    MODALITY channel : {MODALITY, MODALITY_SCOPE}
+    NEGATION channel : {NEGATION, NEGATION_SCOPE}
 
-  emotion_mask  = [0, 0, 0, 0, 1]
-  modality_mask = [0, 0, 0, 0, 0]
-  negation_mask = [0, 0, 1, 0, 0]
+Why scope tokens are included:
+    A modal cue like "might" only conveys hedging via the span it scopes
+    over ("might have happened"). Tagging the cue alone would leave the
+    concept-gated attention with a single-token attention budget — the
+    head can't build a representation of "what is being hedged over".
+    We therefore treat the cue and its dependency-parsed scope as the
+    same concept channel.
 """
+from __future__ import annotations
 
 import ast
-import torch
+import os
+import sys
+import numpy as np
 import pandas as pd
 
+_src = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, _src)
+from bert_features import load_features, word_mask_to_subword_mask
 
-def parse_tags(tag_str):
+# ---------------------------------------------------------------------------
+# Channel → set of tags that activate it
+# ---------------------------------------------------------------------------
+CHANNEL_TAGS = {
+    "emotion":  {"EMOTION"},
+    "modality": {"MODALITY", "MODALITY_SCOPE"},
+    "negation": {"NEGATION", "NEGATION_SCOPE"},
+}
+
+
+def _parse_tags(cell):
+    if isinstance(cell, list):
+        return cell
+    if isinstance(cell, str):
+        try:
+            return ast.literal_eval(cell)
+        except Exception:
+            return []
+    return []
+
+
+def _word_mask(concept_tags, channel: str) -> np.ndarray:
+    allowed = CHANNEL_TAGS[channel]
+    return np.asarray([1 if t in allowed else 0 for t in concept_tags], dtype=np.int8)
+
+
+def build_subword_masks_for_split(
+    split_csv: str,
+    features_npz: str,
+    bert_max_len: int,
+) -> dict:
     """
-    Converts the concept_tags string from CSV back into a Python list.
-    The CSV stores it as a string like "['O', 'NEGATION', 'O']"
-    ast.literal_eval safely converts it back to a real list.
-    """
-    if isinstance(tag_str, list):
-        return tag_str
-    return ast.literal_eval(tag_str)
-
-
-def build_masks_from_tags(concept_tags):
-    """
-    Given a list of concept tag strings, returns three binary lists:
-    one for EMOTION, one for MODALITY, one for NEGATION.
-
     Args:
-        concept_tags: list of strings, e.g. ["O", "EMOTION", "NEGATION", "O"]
+        split_csv   : Phase 1 step7 CSV (e.g. train_split_L128.csv). Must
+                      contain a `concept_tags` column (string-serialized list)
+                      and must align row-for-row with features_npz.
+        features_npz: Phase 2 step3 cache (e.g. bert_features_train_L128.npz).
+                      Must contain `subword_to_word` of shape (N, bert_max_len).
+        bert_max_len: length to project onto.
 
-    Returns:
-        emotion_mask  : list of int (0 or 1), length = len(concept_tags)
-        modality_mask : list of int (0 or 1)
-        negation_mask : list of int (0 or 1)
+    Returns dict with keys {emotion, modality, negation, concept_tokens_per_row}
+    where the first three are float32 arrays of shape (N, bert_max_len).
     """
-    emotion_mask  = [1 if t == "EMOTION"  else 0 for t in concept_tags]
-    modality_mask = [1 if t == "MODALITY" else 0 for t in concept_tags]
-    negation_mask = [1 if t == "NEGATION" else 0 for t in concept_tags]
-    return emotion_mask, modality_mask, negation_mask
+    df = pd.read_csv(split_csv)
+    if "concept_tags" not in df.columns:
+        raise ValueError(f"{split_csv} has no concept_tags column — run Phase 1 step6+step7.")
+    df["concept_tags"] = df["concept_tags"].apply(_parse_tags)
+
+    feats = load_features(features_npz)
+    sw2w = feats["subword_to_word"]                       # (N, T) int32
+    N, T = sw2w.shape
+    assert T == bert_max_len, f"bert_max_len mismatch: {T} vs {bert_max_len}"
+    assert N == len(df), (
+        f"Row count mismatch: csv={len(df)} vs npz={N}. "
+        f"Did Phase 1 step7 and Phase 2 step3 run on the same inputs?"
+    )
+
+    emotion  = np.zeros((N, T), dtype=np.float32)
+    modality = np.zeros((N, T), dtype=np.float32)
+    negation = np.zeros((N, T), dtype=np.float32)
+
+    for i in range(N):
+        tags = df["concept_tags"].iloc[i]
+        if not tags:
+            continue
+        em_word = _word_mask(tags, "emotion")
+        mo_word = _word_mask(tags, "modality")
+        ne_word = _word_mask(tags, "negation")
+        emotion[i]  = word_mask_to_subword_mask(em_word, sw2w[i])
+        modality[i] = word_mask_to_subword_mask(mo_word, sw2w[i])
+        negation[i] = word_mask_to_subword_mask(ne_word, sw2w[i])
+
+    return {
+        "emotion":  emotion,
+        "modality": modality,
+        "negation": negation,
+        "concept_tokens_per_row": (
+            emotion.sum(axis=1) + modality.sum(axis=1) + negation.sum(axis=1)
+        ).astype(np.int32),
+    }
 
 
-def masks_to_tensors(emotion_mask, modality_mask, negation_mask, device):
-    """
-    Converts the three binary lists into PyTorch float tensors.
-    Shape: (sequence_length,)
-
-    We use float32 because these masks are multiplied with attention
-    weights (which are floats) inside the model.
-    """
-    e = torch.tensor(emotion_mask,  dtype=torch.float32).to(device)
-    m = torch.tensor(modality_mask, dtype=torch.float32).to(device)
-    n = torch.tensor(negation_mask, dtype=torch.float32).to(device)
-    return e, m, n
-
-
-def load_masks_for_split(csv_path, max_len):
-    """
-    Loads ALL concept masks from a split CSV (e.g. train_split_L128.csv
-    merged with concept tags from liar_concepts_step6_L128.csv).
-
-    Actually: the concept_tags column is already in liar_concepts_step6_L{L}.csv
-    and step7 splits that file. So the split CSVs already have concept_tags.
-
-    Returns:
-        emotion_masks  : list of lists  (one per row)
-        modality_masks : list of lists
-        negation_masks : list of lists
-    """
-    df = pd.read_csv(csv_path)
-    df["concept_tags"] = df["concept_tags"].apply(parse_tags)
-
-    emotion_masks, modality_masks, negation_masks = [], [], []
-
-    for tags in df["concept_tags"]:
-        # Pad or truncate to max_len so all masks are the same length
-        tags = tags[:max_len]
-        pad_len = max_len - len(tags)
-        tags = tags + ["O"] * pad_len  # pad with "O" (no concept)
-
-        e, m, n = build_masks_from_tags(tags)
-        emotion_masks.append(e)
-        modality_masks.append(m)
-        negation_masks.append(n)
-
-    return emotion_masks, modality_masks, negation_masks
+def cache_subword_masks(
+    split_csv: str,
+    features_npz: str,
+    out_npz: str,
+    bert_max_len: int,
+    overwrite: bool = False,
+):
+    """Compute + cache subword masks for a split (saves ~(N, T)×3 float32)."""
+    if os.path.exists(out_npz) and not overwrite:
+        print(f"[concept_masks] cache exists, skipping: {out_npz}")
+        return
+    masks = build_subword_masks_for_split(split_csv, features_npz, bert_max_len)
+    os.makedirs(os.path.dirname(out_npz), exist_ok=True)
+    np.savez_compressed(out_npz, **masks)
+    em, mo, ne = masks["emotion"], masks["modality"], masks["negation"]
+    frac = (em.sum() + mo.sum() + ne.sum()) / (em.size)
+    print(
+        f"[concept_masks] wrote {out_npz}  "
+        f"E={int(em.sum())} M={int(mo.sum())} N={int(ne.sum())}  "
+        f"subword coverage = {frac*100:.2f}%"
+    )
 
 
-def masks_to_batch_tensor(mask_list, device):
-    """
-    Converts a list of mask lists into a single 2D tensor.
-    Shape: (batch_size, sequence_length)
+def load_subword_masks(out_npz: str) -> dict:
+    d = np.load(out_npz, allow_pickle=False)
+    return {k: d[k] for k in d.files}
 
-    This is what gets passed into the model's forward() call.
-    """
-    return torch.tensor(mask_list, dtype=torch.float32).to(device)
+
+if __name__ == "__main__":
+    # Build + cache masks for all three splits at one L value.
+    # Usage: python src/phase4/concept_masks.py [L]
+    from config import DATA_DIR, BERT_MAX_LEN
+    L = int(sys.argv[1]) if len(sys.argv) > 1 else 128
+    for split in ("train", "val", "test"):
+        cache_subword_masks(
+            split_csv=os.path.join(DATA_DIR, f"{split}_split_L{L}.csv"),
+            features_npz=os.path.join(DATA_DIR, f"bert_features_{split}_L{L}.npz"),
+            out_npz=os.path.join(DATA_DIR, f"concept_masks_{split}_L{L}.npz"),
+            bert_max_len=BERT_MAX_LEN,
+            overwrite=False,
+        )

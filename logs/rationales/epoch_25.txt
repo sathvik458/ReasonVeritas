@@ -3,30 +3,30 @@
 --- Example 1 ---
 Step 1 [Emotion]:   score 0.00 → low     — minimal emotional language — claim is relatively neutral
 Step 2 [Modality]:  score 0.00 → low     — claim is mostly direct and assertive — low hedging
-Step 3 [Negation]:  score 0.30 → medium  — some negation present — partial contradictions
+Step 3 [Negation]:  score 0.49 → medium  — some negation present — partial contradictions
 ─────────────────────────────────────────────
-Verdict:     FAKE
-Confidence:  100.0%
+Verdict:     REAL
+Confidence:  99.7%
 ─────────────────────────────────────────────
-Reasoning: No dominant concept signals found, but the overall linguistic pattern matches fake news characteristics in the training data.
+Reasoning: The claim shows neutral linguistic patterns consistent with factual reporting.
 
 --- Example 2 ---
 Step 1 [Emotion]:   score 0.00 → low     — minimal emotional language — claim is relatively neutral
-Step 2 [Modality]:  score 0.93 → HIGH    — heavy use of hedging words (may/might/could) — claim avoids commitment
-Step 3 [Negation]:  score 0.30 → medium  — some negation present — partial contradictions
+Step 2 [Modality]:  score 0.76 → HIGH    — heavy use of hedging words (may/might/could) — claim avoids commitment
+Step 3 [Negation]:  score 0.43 → medium  — some negation present — partial contradictions
 ─────────────────────────────────────────────
 Verdict:     FAKE
-Confidence:  62.4%
+Confidence:  100.0%
 ─────────────────────────────────────────────
 Reasoning: This claim contains hedging language, which are common indicators of misleading content.
 
 --- Example 3 ---
 Step 1 [Emotion]:   score 0.00 → low     — minimal emotional language — claim is relatively neutral
 Step 2 [Modality]:  score 0.00 → low     — claim is mostly direct and assertive — low hedging
-Step 3 [Negation]:  score 0.46 → medium  — some negation present — partial contradictions
+Step 3 [Negation]:  score 0.55 → medium  — some negation present — partial contradictions
 ─────────────────────────────────────────────
-Verdict:     FAKE
-Confidence:  99.3%
+Verdict:     REAL
+Confidence:  68.8%
 ─────────────────────────────────────────────
-Reasoning: No dominant concept signals found, but the overall linguistic pattern matches fake news characteristics in the training data.
+Reasoning: The claim shows neutral linguistic patterns consistent with factual reporting.
 

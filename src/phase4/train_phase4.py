@@ -1,308 +1,434 @@
 """
-phase4/train_phase4.py
+Phase 4 — Train the concept-gated Chain-of-Thought model on cached BERT features.
 
-Training script for the Chain-of-Thought model (Phase 4).
+Key differences vs. Phase 3:
+  * Uses CoTModel (3 concept-gated attention heads + aux losses)
+  * Loads subword-aligned concept masks (Phase 4 concept_masks.py output)
+  * Multi-task loss:
+        L = CE(main)  +  λ_aux * Σ CE(aux_head)  +  λ_cov * coverage penalty
+    where coverage penalty encourages each head's mean score over examples
+    that *contain* the concept to rise above 0.3 (dead-head prevention).
+  * Saves per-epoch mean scores and rationale samples for inspection.
 
-Key differences from Phase 3's train_model.py:
-  1. Loads concept masks alongside token indices
-  2. Uses CoTModel instead of BiLSTMAttention
-  3. Computes FOUR losses per batch:
-       - main_loss     : CrossEntropy on final_logits vs true label
-       - aux_loss_e    : CrossEntropy on emotion head's logits vs true label
-       - aux_loss_m    : CrossEntropy on modality head's logits vs true label
-       - aux_loss_n    : CrossEntropy on negation head's logits vs true label
-  4. Total loss = main_loss + lambda * (aux_e + aux_m + aux_n)
-  5. Saves rationale examples at end of each epoch
+Usage:
+    python src/phase4/train_phase4.py [--L 128] [--no-meta] [--seed 42]
 
-Run from project root:
-    python src/phase4/train_phase4.py
+Preconditions (run in order):
+    python src/phase1/step6_concept_mapping.py
+    python src/phase1/step7_dataset_split.py
+    python src/phase2/step3_embeddings.py
+    python src/phase4/concept_masks.py 128
 """
+from __future__ import annotations
 
 import os
 import sys
-import pickle
 import csv
+import json
+import argparse
 import numpy as np
+import pandas as pd
 import torch
 import torch.nn as nn
-import torch.optim as optim
-from torch.utils.data import TensorDataset, DataLoader
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
 from sklearn.utils.class_weight import compute_class_weight
+from sklearn.metrics import f1_score, accuracy_score, classification_report
 
-# ---- Path setup ----
-# ---- Path setup (FINAL FIX) ----
-import os
-import sys
-
-CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))        # src/phase4/
-SRC_DIR = os.path.dirname(CURRENT_DIR)                          # src/
-PROJECT_ROOT = os.path.dirname(SRC_DIR)                         # ReasonVeritas/
-
-# Add BOTH src and project root
-sys.path.insert(0, SRC_DIR)
-sys.path.insert(0, PROJECT_ROOT)
-
-
-
-from config import DATA_DIR, EMBEDDING_DIM
+_src = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, _src)
+from config import (
+    DATA_DIR, MODELS_DIR, LOGS_DIR, RESULTS_DIR, BERT_MAX_LEN,
+    TRAIN_BATCH_SIZE, TRAIN_LR, TRAIN_WEIGHT_DECAY, TRAIN_DROPOUT,
+    TRAIN_NUM_EPOCHS, EARLY_STOP_PATIENCE, GRAD_CLIP_NORM, RANDOM_SEED,
+    CONCEPT_AUX_LAMBDA, get_device,
+)
+from bert_features import load_features
+from meta_encoder import (
+    PARTY_VOCAB, CREDIT_COLS, META_TOTAL_DIM,
+    fit_metadata, encode_metadata, describe_vocabs,
+)
+sys.path.insert(0, os.path.join(_src, "phase3"))
 from phase4.cot_model import CoTModel
-from phase4.concept_masks import load_masks_for_split, masks_to_batch_tensor
+from phase4.concept_masks import load_subword_masks, cache_subword_masks
 from phase4.rationale import generate_batch_rationales
 
-os.makedirs("logs",   exist_ok=True)
-os.makedirs("models", exist_ok=True)
-os.makedirs(os.path.join("logs", "rationales"), exist_ok=True)
 
-# -----------------------------------------------------------------------
-# CONFIGURATION
-# -----------------------------------------------------------------------
-L           = 128          # Sequence length — change to 256 or 512 to ablate
-BATCH_SIZE  = 32
-NUM_EPOCHS  = 50
-LR          = 2e-4
-LAMBDA_AUX  = 0.3          # Weight for auxiliary losses
-                            # Total loss = main + 0.3*(aux_e + aux_m + aux_n)
-                            # Increase to force stronger concept reasoning
-                            # Decrease if val accuracy drops below Phase 3 baseline
+# ---------------------------------------------------------------------------
+# Dataset
+# ---------------------------------------------------------------------------
+class CoTDataset(Dataset):
+    def __init__(
+        self,
+        features_npz: str,
+        masks_npz: str,
+        meta: np.ndarray | None = None,
+    ):
+        f = load_features(features_npz)
+        m = load_subword_masks(masks_npz)
+        assert f["features"].shape[0] == m["emotion"].shape[0], (
+            f"row mismatch: feat={f['features'].shape[0]} masks={m['emotion'].shape[0]}"
+        )
+        self.features = torch.from_numpy(f["features"])                         # float32
+        self.attn     = torch.from_numpy(f["attention_mask"]).long()            # int
+        self.labels   = torch.from_numpy(f["labels"]).long()
+        self.em       = torch.from_numpy(m["emotion"])
+        self.mo       = torch.from_numpy(m["modality"])
+        self.ne       = torch.from_numpy(m["negation"])
+        self.meta     = torch.from_numpy(meta).float() if meta is not None else None
 
-HIDDEN_SIZE = 128
+    def __len__(self):
+        return len(self.labels)
 
-label_map     = {"fake": 0, "real": 1}
-label_map_inv = {0: "FAKE", 1: "REAL"}
+    def __getitem__(self, i):
+        base = (
+            self.features[i], self.attn[i],
+            self.em[i], self.mo[i], self.ne[i],
+            self.labels[i],
+        )
+        if self.meta is not None:
+            return base + (self.meta[i],)
+        return base
 
-# -----------------------------------------------------------------------
-# LOAD ENCODED DATA (Phase 2 output)
-# -----------------------------------------------------------------------
-print(f"Loading encoded data for L={L}...")
-with open(os.path.join(DATA_DIR, f"encoded_L{L}.pkl"), "rb") as f:
-    data = pickle.load(f)
 
-X_train = torch.tensor(data["train"]["indices"])
-y_train = torch.tensor(
-    [label_map[l] for l in data["train"]["binary_label"]], dtype=torch.long
-)
+# ---------------------------------------------------------------------------
+# Loss helpers
+# ---------------------------------------------------------------------------
+class LabelSmoothingCE(nn.Module):
+    def __init__(self, smoothing: float = 0.05, weight: torch.Tensor | None = None):
+        super().__init__()
+        self.smoothing = smoothing
+        self.weight = weight
 
-X_val = torch.tensor(data["val"]["indices"])
-y_val = torch.tensor(
-    [label_map[l] for l in data["val"]["binary_label"]], dtype=torch.long
-)
+    def forward(self, logits, targets):
+        n_classes = logits.size(-1)
+        with torch.no_grad():
+            soft = torch.full_like(logits, self.smoothing / (n_classes - 1))
+            soft.scatter_(1, targets.unsqueeze(1), 1.0 - self.smoothing)
+        log_p = F.log_softmax(logits, dim=-1)
+        loss = -(soft * log_p).sum(dim=-1)
+        if self.weight is not None:
+            loss = loss * self.weight[targets]
+        return loss.mean()
 
-print(f"  Train: {len(X_train)} samples | Val: {len(X_val)} samples")
 
-# -----------------------------------------------------------------------
-# LOAD CONCEPT MASKS (Phase 1 step 6 output, via Phase 4 concept_masks.py)
-# The split CSVs (train_split_L128.csv etc.) contain concept_tags because
-# step7 splits liar_concepts_step6_L128.csv which already has that column.
-# -----------------------------------------------------------------------
-print("Loading concept masks...")
-train_csv = os.path.join(DATA_DIR, f"train_split_L{L}.csv")
-val_csv   = os.path.join(DATA_DIR, f"val_split_L{L}.csv")
+def coverage_penalty(score: torch.Tensor, mask: torch.Tensor, target: float = 0.3) -> torch.Tensor:
+    """
+    Penalty that keeps each head 'awake' on examples that DO contain the concept.
+    score: (B, 1)   mask: (B, T) — nonzero row means concept is present.
+    If the mean score across present-examples < target, penalize linearly.
+    """
+    present = (mask.sum(dim=1) > 0).float()
+    if present.sum() < 1:
+        return torch.zeros((), device=score.device)
+    mean_s = (score.squeeze(-1) * present).sum() / present.sum().clamp(min=1.0)
+    return F.relu(target - mean_s)
 
-train_e_masks, train_m_masks, train_n_masks = load_masks_for_split(train_csv, L)
-val_e_masks,   val_m_masks,   val_n_masks   = load_masks_for_split(val_csv,   L)
 
-# Convert mask lists to tensors (shape: N × L)
-train_E = torch.tensor(train_e_masks, dtype=torch.float32)
-train_M = torch.tensor(train_m_masks, dtype=torch.float32)
-train_N = torch.tensor(train_n_masks, dtype=torch.float32)
+def gated_aux_loss(aux_logits, targets, mask, weight=None):
+    """
+    Auxiliary CE that ONLY trains on examples where the concept is present.
+    Without this, the emotion head's aux classifier (trained on all examples
+    even when emotion-context is zero) degenerates to predicting the prior —
+    which is what produced the 'dead emotion head' (E≈0.02) in earlier runs.
+    """
+    present = (mask.sum(dim=1) > 0)
+    if present.sum() < 1:
+        return torch.zeros((), device=aux_logits.device)
+    return F.cross_entropy(aux_logits[present], targets[present], weight=weight)
 
-val_E   = torch.tensor(val_e_masks,   dtype=torch.float32)
-val_M   = torch.tensor(val_m_masks,   dtype=torch.float32)
-val_N   = torch.tensor(val_n_masks,   dtype=torch.float32)
 
-print(f"  Masks loaded. Train emotion tokens: {train_E.sum().int()}")
+# ---------------------------------------------------------------------------
+# Step / evaluate
+# ---------------------------------------------------------------------------
+def _unpack(batch, use_meta, device):
+    if use_meta:
+        feats, amask, em, mo, ne, y, meta = batch
+        return (feats.to(device), amask.to(device),
+                em.to(device), mo.to(device), ne.to(device),
+                y.to(device), meta.to(device))
+    feats, amask, em, mo, ne, y = batch
+    return (feats.to(device), amask.to(device),
+            em.to(device), mo.to(device), ne.to(device),
+            y.to(device), None)
 
-# -----------------------------------------------------------------------
-# BUILD DATASETS AND DATALOADERS
-# Each sample: (input_ids, label, emotion_mask, modality_mask, negation_mask)
-# -----------------------------------------------------------------------
-train_dataset = TensorDataset(X_train, y_train, train_E, train_M, train_N)
-val_dataset   = TensorDataset(X_val,   y_val,   val_E,   val_M,   val_N)
 
-train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
-val_loader   = DataLoader(val_dataset,   batch_size=BATCH_SIZE)
-
-# -----------------------------------------------------------------------
-# DEVICE
-# -----------------------------------------------------------------------
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print(f"  Device: {device}")
-
-# -----------------------------------------------------------------------
-# MODEL
-# -----------------------------------------------------------------------
-embedding_matrix = np.load(os.path.join(DATA_DIR, "embedding_matrix.npy"))
-vocab_size = embedding_matrix.shape[0]
-embed_dim  = embedding_matrix.shape[1]
-
-model = CoTModel(
-    vocab_size=vocab_size,
-    embed_dim=embed_dim,
-    hidden_size=HIDDEN_SIZE,
-    num_classes=2
-)
-
-# Load Phase 3 GloVe embeddings into the backbone
-model.backbone.embedding = nn.Embedding.from_pretrained(
-    torch.tensor(embedding_matrix, dtype=torch.float32),
-    freeze=False
-)
-
-model = model.to(device)
-print(f"  Model parameters: {sum(p.numel() for p in model.parameters()):,}")
-
-# -----------------------------------------------------------------------
-# LOSS AND OPTIMIZER
-# -----------------------------------------------------------------------
-classes = np.unique(y_train.numpy())
-weights = compute_class_weight("balanced", classes=classes, y=y_train.numpy())
-class_weights = torch.tensor(weights, dtype=torch.float32).to(device)
-
-# All four losses use the same class weights — fake/real imbalance applies
-# equally to the main classifier and each concept head
-criterion = nn.CrossEntropyLoss(weight=class_weights)
-
-optimizer = optim.Adam(model.parameters(), lr=LR)
-
-# -----------------------------------------------------------------------
-# LOGGING
-# -----------------------------------------------------------------------
-log_file = "logs/phase4_training_log.csv"
-with open(log_file, "w", newline="") as f:
-    writer = csv.writer(f)
-    writer.writerow([
-        "epoch", "train_loss", "main_loss", "aux_loss",
-        "val_loss", "val_accuracy"
-    ])
-
-# -----------------------------------------------------------------------
-# TRAINING LOOP
-# -----------------------------------------------------------------------
-print(f"\nStarting Phase 4 training — {NUM_EPOCHS} epochs, lambda_aux={LAMBDA_AUX}")
-print("=" * 60)
-
-best_val_acc = 0.0
-
-for epoch in range(NUM_EPOCHS):
-
-    # ---- TRAIN ----
-    model.train()
-    total_loss = 0.0
-    total_main = 0.0
-    total_aux  = 0.0
-
-    for batch in train_loader:
-        input_ids, labels, e_mask, m_mask, n_mask = batch
-        input_ids = input_ids.to(device)
-        labels    = labels.to(device)
-        e_mask    = e_mask.to(device)
-        m_mask    = m_mask.to(device)
-        n_mask    = n_mask.to(device)
-
-        optimizer.zero_grad()
-
-        # Forward pass — returns 8 values
-        (final_logits,
-         emotion_score, modality_score, negation_score,
-         aux_logits_e, aux_logits_m, aux_logits_n,
-         base_alpha) = model(input_ids, e_mask, m_mask, n_mask)
-
-        # ---- Compute losses ----
-        main_loss  = criterion(final_logits, labels)
-
-        # Each concept head independently tries to predict the label
-        # This forces the head to learn concept-relevant features
-        aux_loss_e = criterion(aux_logits_e, labels)
-        aux_loss_m = criterion(aux_logits_m, labels)
-        aux_loss_n = criterion(aux_logits_n, labels)
-
-        aux_loss   = aux_loss_e + aux_loss_m + aux_loss_n
-
-        # Combined loss: main prediction + weighted concept reasoning losses
-        loss = main_loss + LAMBDA_AUX * aux_loss
-
-        loss.backward()
-        optimizer.step()
-
-        total_loss += loss.item()
-        total_main += main_loss.item()
-        total_aux  += aux_loss.item()
-
-    avg_loss = total_loss / len(train_loader)
-    avg_main = total_main / len(train_loader)
-    avg_aux  = total_aux  / len(train_loader)
-
-    # ---- VALIDATE ----
+@torch.no_grad()
+def evaluate(model, loader, main_criterion, use_meta, device):
     model.eval()
-    correct   = 0
-    total     = 0
-    val_loss  = 0.0
+    losses, preds, ys = [], [], []
+    em_avg, mo_avg, ne_avg = [], [], []
+    for batch in loader:
+        feats, amask, em_m, mo_m, ne_m, y, meta = _unpack(batch, use_meta, device)
+        out = model(feats, amask, em_m, mo_m, ne_m, meta)
+        logits, em_s, mo_s, ne_s = out[0], out[1], out[2], out[3]
+        losses.append(main_criterion(logits, y).item())
+        preds.append(logits.argmax(dim=-1).cpu().numpy())
+        ys.append(y.cpu().numpy())
+        em_avg.append(em_s.mean().item())
+        mo_avg.append(mo_s.mean().item())
+        ne_avg.append(ne_s.mean().item())
+    preds = np.concatenate(preds); ys = np.concatenate(ys)
+    return {
+        "loss":     float(np.mean(losses)),
+        "acc":      float(accuracy_score(ys, preds)),
+        "macro_f1": float(f1_score(ys, preds, average="macro")),
+        "em_mean":  float(np.mean(em_avg)),
+        "mo_mean":  float(np.mean(mo_avg)),
+        "ne_mean":  float(np.mean(ne_avg)),
+        "preds":    preds,
+        "labels":   ys,
+    }
 
-    # For saving example rationales
-    sample_rationales = []
 
-    with torch.no_grad():
-        for batch in val_loader:
-            input_ids, labels, e_mask, m_mask, n_mask = batch
-            input_ids = input_ids.to(device)
-            labels    = labels.to(device)
-            e_mask    = e_mask.to(device)
-            m_mask    = m_mask.to(device)
-            n_mask    = n_mask.to(device)
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+def main(L: int = 128, use_meta: bool = True, seed: int = RANDOM_SEED):
+    torch.manual_seed(seed); np.random.seed(seed)
+    device = get_device()
+    print(f"\nPhase 4 training (L={L}, meta={use_meta}, seed={seed}, device={device})")
 
-            (final_logits,
-             emotion_score, modality_score, negation_score,
-             aux_logits_e, aux_logits_m, aux_logits_n,
-             base_alpha) = model(input_ids, e_mask, m_mask, n_mask)
+    # ----- Build concept-mask caches on demand -----
+    for split in ("train", "val", "test"):
+        cache_subword_masks(
+            split_csv=os.path.join(DATA_DIR, f"{split}_split_L{L}.csv"),
+            features_npz=os.path.join(DATA_DIR, f"bert_features_{split}_L{L}.npz"),
+            out_npz=os.path.join(DATA_DIR, f"concept_masks_{split}_L{L}.npz"),
+            bert_max_len=BERT_MAX_LEN,
+            overwrite=False,
+        )
 
-            loss = criterion(final_logits, labels)
-            val_loss += loss.item()
+    # ----- Metadata -----
+    meta_dim = 0
+    meta_vocabs = None
+    train_meta = val_meta = test_meta = None
+    if use_meta:
+        train_csv = pd.read_csv(os.path.join(DATA_DIR, f"train_split_L{L}.csv"))
+        val_csv   = pd.read_csv(os.path.join(DATA_DIR, f"val_split_L{L}.csv"))
+        test_csv  = pd.read_csv(os.path.join(DATA_DIR, f"test_split_L{L}.csv"))
+        # Fit on TRAIN ONLY (no leakage into val/test)
+        meta_vocabs, scaler = fit_metadata(train_csv)
+        train_meta = encode_metadata(train_csv, meta_vocabs, scaler)
+        val_meta   = encode_metadata(val_csv,   meta_vocabs, scaler)
+        test_meta  = encode_metadata(test_csv,  meta_vocabs, scaler)
+        meta_dim = train_meta.shape[1]
+        print(
+            f"  metadata dim = {meta_dim} "
+            f"(party {len(PARTY_VOCAB)} + credit {len(CREDIT_COLS)} + speaker/subject/context idx)"
+        )
+        print(f"  vocabs: {describe_vocabs(meta_vocabs)}")
 
-            preds   = torch.argmax(final_logits, dim=1)
-            correct += (preds == labels).sum().item()
-            total   += labels.size(0)
-
-            # Save first batch's rationales for inspection
-            if len(sample_rationales) == 0:
-                batch_rationales = generate_batch_rationales(
-                    emotion_score, modality_score, negation_score,
-                    final_logits, label_map_inv
-                )
-                sample_rationales = batch_rationales[:3]  # save 3 examples
-
-    val_loss = val_loss / len(val_loader)
-    accuracy = correct / total
-
-    # ---- LOG ----
-    with open(log_file, "a", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow([epoch+1, avg_loss, avg_main, avg_aux, val_loss, accuracy])
-
-    # ---- SAVE BEST MODEL ----
-    if accuracy > best_val_acc:
-        best_val_acc = accuracy
-        torch.save(model.state_dict(), "models/cot_model_best.pt")
-        print(f"  ✓ Model saved (val_acc={accuracy:.4f})")
-
-    # ---- PRINT EPOCH SUMMARY ----
+    # ----- Datasets -----
+    def ds(split, meta):
+        return CoTDataset(
+            features_npz=os.path.join(DATA_DIR, f"bert_features_{split}_L{L}.npz"),
+            masks_npz   =os.path.join(DATA_DIR, f"concept_masks_{split}_L{L}.npz"),
+            meta=meta,
+        )
+    train_ds = ds("train", train_meta)
+    val_ds   = ds("val",   val_meta)
+    test_ds  = ds("test",  test_meta)
+    print(f"  train={len(train_ds)} val={len(val_ds)} test={len(test_ds)}")
     print(
-        f"Epoch {epoch+1:>2}/{NUM_EPOCHS} | "
-        f"Loss: {avg_loss:.4f} (main={avg_main:.4f} aux={avg_aux:.4f}) | "
-        f"Val Loss: {val_loss:.4f} | Val Acc: {accuracy:.4f}"
+        f"  concept coverage train:  "
+        f"E={int(train_ds.em.sum())}  M={int(train_ds.mo.sum())}  "
+        f"N={int(train_ds.ne.sum())}  "
+        f"({(train_ds.em.sum()+train_ds.mo.sum()+train_ds.ne.sum())/train_ds.em.numel()*100:.2f}% of subwords)"
     )
+    if (train_ds.em.sum() + train_ds.mo.sum() + train_ds.ne.sum()) < 1000:
+        print(
+            "\n  !!!  Concept coverage is suspiciously low.\n"
+            "       You probably need to re-run Phase 1 with the NEW step6:\n"
+            "           python src/phase1/step6_concept_mapping.py\n"
+            "           python src/phase1/step7_dataset_split.py\n"
+            "       then DELETE data/concept_masks_*_L*.npz and re-run this script.\n"
+        )
 
-    # ---- SAVE RATIONALE EXAMPLES every 5 epochs ----
-    if (epoch + 1) % 5 == 0 and sample_rationales:
-        rationale_path = f"logs/rationales/epoch_{epoch+1:02d}.txt"
-        with open(rationale_path, "w", encoding="utf-8") as f:
-            f.write(f"=== Epoch {epoch+1} — Sample Rationales ===\n\n")
-            for i, (r, v, c) in enumerate(sample_rationales):
-                f.write(f"--- Example {i+1} ---\n")
-                f.write(r + "\n\n")
-        print(f"  Rationales saved → {rationale_path}")
+    train_loader = DataLoader(train_ds, batch_size=TRAIN_BATCH_SIZE, shuffle=True)
+    val_loader   = DataLoader(val_ds,   batch_size=TRAIN_BATCH_SIZE)
+    test_loader  = DataLoader(test_ds,  batch_size=TRAIN_BATCH_SIZE)
 
-print("\n" + "=" * 60)
-print(f"Training complete. Best val accuracy: {best_val_acc:.4f}")
-print(f"Model saved to: models/cot_model_best.pt")
-print(f"Training log:   logs/phase4_training_log.csv")
-print(f"Rationales:     logs/rationales/")
+    # ----- Model -----
+    # When use_meta=True we pass meta_vocabs so CoTModel uses MetaEncoder
+    # (party one-hot + credit z-scored + speaker/subject/context embeddings)
+    model = CoTModel(
+        bert_dim=768,
+        hidden_size=192,
+        num_lstm_layers=1,
+        num_attn_heads=4,
+        meta_dim=0,
+        meta_vocabs=meta_vocabs,
+        num_classes=2,
+        dropout=TRAIN_DROPOUT,
+    ).to(device)
+    n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"  trainable params: {n_params:,}")
+
+    # ----- Class weights + losses -----
+    y_train_np = train_ds.labels.numpy()
+    classes = np.unique(y_train_np)
+    cw = compute_class_weight("balanced", classes=classes, y=y_train_np)
+    cw_t = torch.tensor(cw, dtype=torch.float32, device=device)
+    main_criterion = LabelSmoothingCE(smoothing=0.05, weight=cw_t)
+    # aux_criterion is no longer used — see gated_aux_loss above.
+    # Keeping the symbol available in case downstream scripts import it.
+    aux_criterion  = nn.CrossEntropyLoss(weight=cw_t)  # noqa: F841
+
+    # ----- Optimizer + warmup/decay -----
+    lr = 5e-4
+    optimizer = torch.optim.AdamW(
+        model.parameters(), lr=lr, weight_decay=TRAIN_WEIGHT_DECAY
+    )
+    total_steps  = len(train_loader) * TRAIN_NUM_EPOCHS
+    warmup_steps = max(1, int(0.1 * total_steps))
+
+    def lr_lambda(step):
+        if step < warmup_steps:
+            return step / warmup_steps
+        progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
+        return max(0.1, 0.5 * (1 + np.cos(np.pi * progress)))  # cosine, floor 0.1
+
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
+    # ----- Logging -----
+    log_path = os.path.join(LOGS_DIR, f"phase4_train_L{L}.csv")
+    with open(log_path, "w", newline="") as f:
+        csv.writer(f).writerow([
+            "epoch", "train_loss", "main_loss", "aux_loss", "cov_loss",
+            "val_loss", "val_acc", "val_macro_f1",
+            "em_mean", "mo_mean", "ne_mean", "lr",
+        ])
+
+    best_f1, best_state, patience = -1.0, None, 0
+    LAMBDA_AUX = CONCEPT_AUX_LAMBDA
+    LAMBDA_COV = 0.05
+
+    for epoch in range(1, TRAIN_NUM_EPOCHS + 1):
+        model.train()
+        tot_loss = tot_main = tot_aux = tot_cov = 0.0
+        n_batches = 0
+        for batch in train_loader:
+            (feats, amask, em_m, mo_m, ne_m, y, meta) = _unpack(batch, use_meta, device)
+            optimizer.zero_grad()
+            (logits,
+             em_s, mo_s, ne_s,
+             em_aux, mo_aux, ne_aux,
+             _, _, _,
+             _) = model(feats, amask, em_m, mo_m, ne_m, meta)
+
+            main_loss = main_criterion(logits, y)
+            # Concept-presence-gated aux loss: each head's aux classifier
+            # contributes only on examples where its concept actually appears.
+            # Replaces the flat CE that produced the dead emotion head.
+            aux_loss  = (
+                gated_aux_loss(em_aux, y, em_m, weight=cw_t) +
+                gated_aux_loss(mo_aux, y, mo_m, weight=cw_t) +
+                gated_aux_loss(ne_aux, y, ne_m, weight=cw_t)
+            )
+            cov_loss  = coverage_penalty(em_s, em_m) \
+                      + coverage_penalty(mo_s, mo_m) \
+                      + coverage_penalty(ne_s, ne_m)
+
+            loss = main_loss + LAMBDA_AUX * aux_loss + LAMBDA_COV * cov_loss
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP_NORM)
+            optimizer.step()
+            scheduler.step()
+
+            tot_loss += loss.item()
+            tot_main += main_loss.item()
+            tot_aux  += aux_loss.item()
+            tot_cov  += cov_loss.item()
+            n_batches += 1
+
+        train_loss = tot_loss / n_batches
+        avg_main   = tot_main / n_batches
+        avg_aux    = tot_aux  / n_batches
+        avg_cov    = tot_cov  / n_batches
+
+        val = evaluate(model, val_loader, main_criterion, use_meta, device)
+        cur_lr = optimizer.param_groups[0]["lr"]
+
+        with open(log_path, "a", newline="") as f:
+            csv.writer(f).writerow([
+                epoch, train_loss, avg_main, avg_aux, avg_cov,
+                val["loss"], val["acc"], val["macro_f1"],
+                val["em_mean"], val["mo_mean"], val["ne_mean"], cur_lr,
+            ])
+
+        marker = ""
+        if val["macro_f1"] > best_f1:
+            best_f1 = val["macro_f1"]
+            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+            torch.save(best_state, os.path.join(MODELS_DIR, f"phase4_L{L}_best.pt"))
+            patience = 0
+            marker = " *"
+        else:
+            patience += 1
+
+        print(
+            f"ep {epoch:02d}  "
+            f"train_loss={train_loss:.4f}  "
+            f"val_acc={val['acc']:.4f}  val_f1={val['macro_f1']:.4f}  "
+            f"E={val['em_mean']:.2f} M={val['mo_mean']:.2f} N={val['ne_mean']:.2f}  "
+            f"lr={cur_lr:.2e}{marker}"
+        )
+        if patience >= EARLY_STOP_PATIENCE:
+            print(f"  early stop @ epoch {epoch}")
+            break
+
+    # ----- Test -----
+    model.load_state_dict(best_state)
+    test = evaluate(model, test_loader, main_criterion, use_meta, device)
+    print("\nTEST RESULTS")
+    print(f"  acc       = {test['acc']:.4f}")
+    print(f"  macro_f1  = {test['macro_f1']:.4f}")
+    print(classification_report(
+        test["labels"], test["preds"], target_names=["fake", "real"], digits=4
+    ))
+
+    # ----- Save rationale samples from test set -----
+    model.eval()
+    rat_dir = os.path.join(LOGS_DIR, "rationales_phase4")
+    os.makedirs(rat_dir, exist_ok=True)
+    with torch.no_grad():
+        for batch in test_loader:
+            (feats, amask, em_m, mo_m, ne_m, y, meta) = _unpack(batch, use_meta, device)
+            out = model(feats, amask, em_m, mo_m, ne_m, meta)
+            logits, em_s, mo_s, ne_s = out[0], out[1], out[2], out[3]
+            batch_rats = generate_batch_rationales(em_s, mo_s, ne_s, logits)
+            out_path = os.path.join(rat_dir, f"sample_L{L}.txt")
+            with open(out_path, "w") as f:
+                for i, (rat, _, _) in enumerate(batch_rats[:10]):
+                    f.write(f"--- example {i+1} ---\n{rat}\n\n")
+            break
+    print(f"  sample rationales -> {out_path}")
+
+    # ----- Save final results -----
+    results = {
+        "phase": 4,
+        "L": L,
+        "use_meta": use_meta,
+        "seed": seed,
+        "best_val_macro_f1": best_f1,
+        "test_acc": test["acc"],
+        "test_macro_f1": test["macro_f1"],
+        "n_params": n_params,
+        "device": str(device),
+        "em_mean": test["em_mean"],
+        "mo_mean": test["mo_mean"],
+        "ne_mean": test["ne_mean"],
+    }
+    with open(os.path.join(RESULTS_DIR, f"phase4_L{L}_seed{seed}.json"), "w") as f:
+        json.dump(results, f, indent=2)
+    print(f"  results -> {RESULTS_DIR}/phase4_L{L}_seed{seed}.json")
+
+
+if __name__ == "__main__":
+    p = argparse.ArgumentParser()
+    p.add_argument("--L", type=int, default=128)
+    p.add_argument("--no-meta", action="store_true")
+    p.add_argument("--seed", type=int, default=RANDOM_SEED)
+    args = p.parse_args()
+    main(L=args.L, use_meta=not args.no_meta, seed=args.seed)
