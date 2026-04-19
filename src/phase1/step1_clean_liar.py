@@ -27,13 +27,39 @@ test  = pd.read_csv(test_path,  sep="\t", header=None)
 # Combine train, validation and test into one dataframe
 df = pd.concat([train, valid, test], ignore_index=True)
 
-# Column index 2 contains the actual statement
-# Column index 1 contains the label
-df = df[[2, 1]]
-df.columns = ["statement", "label"]
+# LIAR raw columns:
+#   0 = id, 1 = label, 2 = statement, 3 = subject(s),
+#   4 = speaker, 5 = job, 6 = state, 7 = party,
+#   8 = barely_true_count, 9 = false_count, 10 = half_true_count,
+#   11 = mostly_true_count, 12 = pants_fire_count, 13 = context
+# We keep statement + label (required) and the metadata columns that push
+# LIAR baselines from ~62 % to ~70-77 % (Wang 2017, Karimi & Tang 2019).
+META_COLS = {
+    1:  "label",
+    2:  "statement",
+    3:  "subject",
+    4:  "speaker",
+    7:  "party",
+    8:  "barely_true_count",
+    9:  "false_count",
+    10: "half_true_count",
+    11: "mostly_true_count",
+    12: "pants_fire_count",
+    13: "context",
+}
+df = df[list(META_COLS.keys())].rename(columns=META_COLS)
 
-# Remove rows where statement or label is missing
-df = df.dropna()
+# Drop only rows missing the two required fields; metadata may legitimately be NaN
+df = df.dropna(subset=["statement", "label"])
+
+# Fill missing categorical metadata with explicit "unknown" sentinel
+for col in ["subject", "speaker", "party", "context"]:
+    df[col] = df[col].fillna("unknown").astype(str)
+
+# Fill missing credit-history counts with 0 (treat as no prior record)
+for col in ["barely_true_count", "false_count", "half_true_count",
+            "mostly_true_count", "pants_fire_count"]:
+    df[col] = df[col].fillna(0).astype(float)
 
 
 
