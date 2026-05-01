@@ -148,11 +148,17 @@ class BiLSTMAttention(nn.Module):
         features: torch.Tensor,
         attention_mask: torch.Tensor,
         metadata: torch.Tensor | None = None,
+        has_meta: torch.Tensor | None = None,
     ):
         H, attn_weights, pooled = self.encode(features, attention_mask)
 
         if self.meta_proj is not None and metadata is not None:
-            m = self.meta_proj(metadata)
+            # MetaEncoder accepts a has_meta mask; the legacy Linear branch
+            # does not. Detect by presence of meta_vocabs.
+            if self.meta_vocabs is not None:
+                m = self.meta_proj(metadata, has_meta=has_meta)
+            else:
+                m = self.meta_proj(metadata)
             pooled = torch.cat([pooled, m], dim=-1)
 
         logits = self.classifier(pooled)

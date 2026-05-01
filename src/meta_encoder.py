@@ -93,6 +93,13 @@ def fit_metadata(
     Fit the categorical vocabularies AND the credit-history scaler from the
     TRAIN split only. Returns (vocabs, scaler).
 
+    Cross-domain note: when training on the merged LIAR + CoAID corpus,
+    CoAID rows are flagged with `has_meta == 0` (no speaker/party/credit).
+    We fit vocabs and the credit-history scaler ONLY on LIAR rows
+    (has_meta == 1) so CoAID's empty strings don't crowd out real LIAR
+    speaker/subject/context tokens, and their zero credit counts don't
+    deflate mu / sd.
+
     vocabs = {
         "speaker": {name: idx},
         "subject": {name: idx},
@@ -103,11 +110,19 @@ def fit_metadata(
 
     scaler = {"mu": np.ndarray(5,), "sd": np.ndarray(5,)}
     """
-    spk_vocab = _top_k_vocab([_norm(s) for s in train_df["speaker"]], speaker_top_k)
-    sub_vocab = _top_k_vocab([_first_subject(s) for s in train_df["subject"]], subject_top_k)
-    ctx_vocab = _top_k_vocab([_norm(s) for s in train_df["context"]], context_top_k)
+    if "has_meta" in train_df.columns:
+        fit_df = train_df[train_df["has_meta"] == 1]
+        if len(fit_df) == 0:
+            # Pathological: no metadata-bearing rows. Fall back to whole train.
+            fit_df = train_df
+    else:
+        fit_df = train_df
 
-    counts = train_df[CREDIT_COLS].fillna(0).astype(np.float32).values  # (N, 5)
+    spk_vocab = _top_k_vocab([_norm(s) for s in fit_df["speaker"]], speaker_top_k)
+    sub_vocab = _top_k_vocab([_first_subject(s) for s in fit_df["subject"]], subject_top_k)
+    ctx_vocab = _top_k_vocab([_norm(s) for s in fit_df["context"]], context_top_k)
+
+    counts = fit_df[CREDIT_COLS].fillna(0).astype(np.float32).values  # (N, 5)
     mu = counts.mean(axis=0)
     sd = counts.std(axis=0).clip(min=1e-6)
 
@@ -214,7 +229,17 @@ class MetaEncoder(nn.Module):
         )
         self.out_dim = out_dim
 
-    def forward(self, meta: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        meta: torch.Tensor,
+        has_meta: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """
+        meta     : (B, 15) packed metadata tensor
+        has_meta : (B,) optional float/long mask in {0, 1}. When provided, the
+                   output for rows with has_meta == 0 is zeroed (used for
+                   joint LIAR + CoAID training where CoAID has no metadata).
+        """
         # Slice the packed tensor
         party  = meta[:, : self.party_dim]
         credit = meta[:, self.party_dim : self.party_dim + self.credit_dim]
@@ -233,4 +258,8 @@ class MetaEncoder(nn.Module):
             ],
             dim=-1,
         )
-        return self.proj(x)
+        out = self.proj(x)
+        if has_meta is not None:
+            # Cast and broadcast — zeros every CoAID row out cleanly.
+            out = out * has_meta.to(out.dtype).unsqueeze(-1)
+        return out

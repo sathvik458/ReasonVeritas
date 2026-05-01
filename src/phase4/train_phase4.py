@@ -44,6 +44,7 @@ from config import (
     CONCEPT_AUX_LAMBDA, get_device,
 )
 from bert_features import load_features
+from balanced_sampling import build_balanced_sampler, describe_buckets
 from meta_encoder import (
     PARTY_VOCAB, CREDIT_COLS, META_TOTAL_DIM,
     fit_metadata, encode_metadata, describe_vocabs,
@@ -63,6 +64,7 @@ class CoTDataset(Dataset):
         features_npz: str,
         masks_npz: str,
         meta: np.ndarray | None = None,
+        has_meta: np.ndarray | None = None,
     ):
         f = load_features(features_npz)
         m = load_subword_masks(masks_npz)
@@ -76,6 +78,9 @@ class CoTDataset(Dataset):
         self.mo       = torch.from_numpy(m["modality"])
         self.ne       = torch.from_numpy(m["negation"])
         self.meta     = torch.from_numpy(meta).float() if meta is not None else None
+        self.has_meta = (
+            torch.from_numpy(has_meta).float() if has_meta is not None else None
+        )
 
     def __len__(self):
         return len(self.labels)
@@ -87,7 +92,8 @@ class CoTDataset(Dataset):
             self.labels[i],
         )
         if self.meta is not None:
-            return base + (self.meta[i],)
+            hm = self.has_meta[i] if self.has_meta is not None else torch.tensor(1.0)
+            return base + (self.meta[i], hm)
         return base
 
 
@@ -143,24 +149,24 @@ def gated_aux_loss(aux_logits, targets, mask, weight=None):
 # ---------------------------------------------------------------------------
 def _unpack(batch, use_meta, device):
     if use_meta:
-        feats, amask, em, mo, ne, y, meta = batch
+        feats, amask, em, mo, ne, y, meta, has_meta = batch
         return (feats.to(device), amask.to(device),
                 em.to(device), mo.to(device), ne.to(device),
-                y.to(device), meta.to(device))
+                y.to(device), meta.to(device), has_meta.to(device))
     feats, amask, em, mo, ne, y = batch
     return (feats.to(device), amask.to(device),
             em.to(device), mo.to(device), ne.to(device),
-            y.to(device), None)
+            y.to(device), None, None)
 
 
 @torch.no_grad()
 def evaluate(model, loader, main_criterion, use_meta, device):
     model.eval()
-    losses, preds, ys = [], [], []
+    losses, preds, ys, hms = [], [], [], []
     em_avg, mo_avg, ne_avg = [], [], []
     for batch in loader:
-        feats, amask, em_m, mo_m, ne_m, y, meta = _unpack(batch, use_meta, device)
-        out = model(feats, amask, em_m, mo_m, ne_m, meta)
+        feats, amask, em_m, mo_m, ne_m, y, meta, has_meta = _unpack(batch, use_meta, device)
+        out = model(feats, amask, em_m, mo_m, ne_m, meta, has_meta=has_meta)
         logits, em_s, mo_s, ne_s = out[0], out[1], out[2], out[3]
         losses.append(main_criterion(logits, y).item())
         preds.append(logits.argmax(dim=-1).cpu().numpy())
@@ -168,7 +174,10 @@ def evaluate(model, loader, main_criterion, use_meta, device):
         em_avg.append(em_s.mean().item())
         mo_avg.append(mo_s.mean().item())
         ne_avg.append(ne_s.mean().item())
+        if has_meta is not None:
+            hms.append(has_meta.cpu().numpy())
     preds = np.concatenate(preds); ys = np.concatenate(ys)
+    has_meta_arr = np.concatenate(hms) if hms else None
     return {
         "loss":     float(np.mean(losses)),
         "acc":      float(accuracy_score(ys, preds)),
@@ -178,23 +187,76 @@ def evaluate(model, loader, main_criterion, use_meta, device):
         "ne_mean":  float(np.mean(ne_avg)),
         "preds":    preds,
         "labels":   ys,
+        "has_meta": has_meta_arr,
     }
+
+
+def per_domain_breakdown(preds, ys, has_meta_arr):
+    """LIAR (has_meta=1) vs CoAID (has_meta=0) acc / macro_f1."""
+    if has_meta_arr is None:
+        return None
+    out = {}
+    for name, mask_val in (("liar", 1.0), ("coaid", 0.0)):
+        m = (has_meta_arr == mask_val)
+        n = int(m.sum())
+        if n < 1:
+            continue
+        out[name] = {
+            "n":        n,
+            "acc":      float(accuracy_score(ys[m], preds[m])),
+            "macro_f1": float(f1_score(ys[m], preds[m], average="macro")),
+        }
+    return out
 
 
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
-def main(L: int = 128, use_meta: bool = True, seed: int = RANDOM_SEED):
+def _paths(L: int, dataset: str) -> dict:
+    if dataset == "liar":
+        feat_pre = "bert_features"
+        mask_pre = "concept_masks"
+        split_pre = ""
+    else:
+        feat_pre = f"bert_features_{dataset}"
+        mask_pre = f"concept_masks_{dataset}"
+        split_pre = f"{dataset}_"
+    return {
+        "feat_train": os.path.join(DATA_DIR, f"{feat_pre}_train_L{L}.npz"),
+        "feat_val":   os.path.join(DATA_DIR, f"{feat_pre}_val_L{L}.npz"),
+        "feat_test":  os.path.join(DATA_DIR, f"{feat_pre}_test_L{L}.npz"),
+        "mask_train": os.path.join(DATA_DIR, f"{mask_pre}_train_L{L}.npz"),
+        "mask_val":   os.path.join(DATA_DIR, f"{mask_pre}_val_L{L}.npz"),
+        "mask_test":  os.path.join(DATA_DIR, f"{mask_pre}_test_L{L}.npz"),
+        "csv_train":  os.path.join(DATA_DIR, f"{split_pre}train_split_L{L}.csv"),
+        "csv_val":    os.path.join(DATA_DIR, f"{split_pre}val_split_L{L}.csv"),
+        "csv_test":   os.path.join(DATA_DIR, f"{split_pre}test_split_L{L}.csv"),
+    }
+
+
+def main(
+    L: int = 128,
+    use_meta: bool = True,
+    seed: int = RANDOM_SEED,
+    dataset: str = "liar",
+    balance: bool = False,
+):
     torch.manual_seed(seed); np.random.seed(seed)
     device = get_device()
-    print(f"\nPhase 4 training (L={L}, meta={use_meta}, seed={seed}, device={device})")
+    print(f"\nPhase 4 training (dataset={dataset}, L={L}, meta={use_meta}, seed={seed}, device={device})")
+
+    paths = _paths(L, dataset)
 
     # ----- Build concept-mask caches on demand -----
-    for split in ("train", "val", "test"):
+    for split, csv_p, feat_p, mask_p in [
+        ("train", paths["csv_train"], paths["feat_train"], paths["mask_train"]),
+        ("val",   paths["csv_val"],   paths["feat_val"],   paths["mask_val"]),
+        ("test",  paths["csv_test"],  paths["feat_test"],  paths["mask_test"]),
+    ]:
         cache_subword_masks(
-            split_csv=os.path.join(DATA_DIR, f"{split}_split_L{L}.csv"),
-            features_npz=os.path.join(DATA_DIR, f"bert_features_{split}_L{L}.npz"),
-            out_npz=os.path.join(DATA_DIR, f"concept_masks_{split}_L{L}.npz"),
+            split_csv=csv_p,
+            features_npz=feat_p,
+            out_npz=mask_p,
             bert_max_len=BERT_MAX_LEN,
             overwrite=False,
         )
@@ -203,11 +265,12 @@ def main(L: int = 128, use_meta: bool = True, seed: int = RANDOM_SEED):
     meta_dim = 0
     meta_vocabs = None
     train_meta = val_meta = test_meta = None
+    train_has = val_has = test_has = None
     if use_meta:
-        train_csv = pd.read_csv(os.path.join(DATA_DIR, f"train_split_L{L}.csv"))
-        val_csv   = pd.read_csv(os.path.join(DATA_DIR, f"val_split_L{L}.csv"))
-        test_csv  = pd.read_csv(os.path.join(DATA_DIR, f"test_split_L{L}.csv"))
-        # Fit on TRAIN ONLY (no leakage into val/test)
+        train_csv = pd.read_csv(paths["csv_train"])
+        val_csv   = pd.read_csv(paths["csv_val"])
+        test_csv  = pd.read_csv(paths["csv_test"])
+        # Fit on TRAIN ONLY, restricted to has_meta=1 rows internally
         meta_vocabs, scaler = fit_metadata(train_csv)
         train_meta = encode_metadata(train_csv, meta_vocabs, scaler)
         val_meta   = encode_metadata(val_csv,   meta_vocabs, scaler)
@@ -219,16 +282,28 @@ def main(L: int = 128, use_meta: bool = True, seed: int = RANDOM_SEED):
         )
         print(f"  vocabs: {describe_vocabs(meta_vocabs)}")
 
+        if "has_meta" in train_csv.columns:
+            train_has = train_csv["has_meta"].astype(np.float32).values
+            val_has   = val_csv["has_meta"].astype(np.float32).values
+            test_has  = test_csv["has_meta"].astype(np.float32).values
+            print(f"  has_meta:    train fraction = {train_has.mean():.3f}  "
+                  f"val = {val_has.mean():.3f}  test = {test_has.mean():.3f}")
+        else:
+            train_has = np.ones(len(train_csv), dtype=np.float32)
+            val_has   = np.ones(len(val_csv),   dtype=np.float32)
+            test_has  = np.ones(len(test_csv),  dtype=np.float32)
+
     # ----- Datasets -----
-    def ds(split, meta):
+    def ds(split, meta, has):
         return CoTDataset(
-            features_npz=os.path.join(DATA_DIR, f"bert_features_{split}_L{L}.npz"),
-            masks_npz   =os.path.join(DATA_DIR, f"concept_masks_{split}_L{L}.npz"),
+            features_npz=paths[f"feat_{split}"],
+            masks_npz   =paths[f"mask_{split}"],
             meta=meta,
+            has_meta=has,
         )
-    train_ds = ds("train", train_meta)
-    val_ds   = ds("val",   val_meta)
-    test_ds  = ds("test",  test_meta)
+    train_ds = ds("train", train_meta, train_has)
+    val_ds   = ds("val",   val_meta,   val_has)
+    test_ds  = ds("test",  test_meta,  test_has)
     print(f"  train={len(train_ds)} val={len(val_ds)} test={len(test_ds)}")
     print(
         f"  concept coverage train:  "
@@ -245,7 +320,22 @@ def main(L: int = 128, use_meta: bool = True, seed: int = RANDOM_SEED):
             "       then DELETE data/concept_masks_*_L*.npz and re-run this script.\n"
         )
 
-    train_loader = DataLoader(train_ds, batch_size=TRAIN_BATCH_SIZE, shuffle=True)
+    sampler = None
+    if balance:
+        sampler = build_balanced_sampler(
+            has_meta=train_has,
+            labels=train_ds.labels.numpy(),
+        )
+        if sampler is None:
+            print("  [balance] only one (domain, class) bucket present — falling back to shuffle.")
+        else:
+            print(f"  [balance] domain-balanced sampler enabled. "
+                  f"Train buckets: {describe_buckets(train_has, train_ds.labels.numpy())}")
+
+    if sampler is None:
+        train_loader = DataLoader(train_ds, batch_size=TRAIN_BATCH_SIZE, shuffle=True)
+    else:
+        train_loader = DataLoader(train_ds, batch_size=TRAIN_BATCH_SIZE, sampler=sampler)
     val_loader   = DataLoader(val_ds,   batch_size=TRAIN_BATCH_SIZE)
     test_loader  = DataLoader(test_ds,  batch_size=TRAIN_BATCH_SIZE)
 
@@ -292,7 +382,8 @@ def main(L: int = 128, use_meta: bool = True, seed: int = RANDOM_SEED):
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
     # ----- Logging -----
-    log_path = os.path.join(LOGS_DIR, f"phase4_train_L{L}.csv")
+    tag = f"phase4_L{L}" if dataset == "liar" else f"phase4_{dataset}_L{L}"
+    log_path = os.path.join(LOGS_DIR, f"{tag}_train.csv")
     with open(log_path, "w", newline="") as f:
         csv.writer(f).writerow([
             "epoch", "train_loss", "main_loss", "aux_loss", "cov_loss",
@@ -309,13 +400,13 @@ def main(L: int = 128, use_meta: bool = True, seed: int = RANDOM_SEED):
         tot_loss = tot_main = tot_aux = tot_cov = 0.0
         n_batches = 0
         for batch in train_loader:
-            (feats, amask, em_m, mo_m, ne_m, y, meta) = _unpack(batch, use_meta, device)
+            (feats, amask, em_m, mo_m, ne_m, y, meta, has_meta) = _unpack(batch, use_meta, device)
             optimizer.zero_grad()
             (logits,
              em_s, mo_s, ne_s,
              em_aux, mo_aux, ne_aux,
              _, _, _,
-             _) = model(feats, amask, em_m, mo_m, ne_m, meta)
+             _) = model(feats, amask, em_m, mo_m, ne_m, meta, has_meta=has_meta)
 
             main_loss = main_criterion(logits, y)
             # Concept-presence-gated aux loss: each head's aux classifier
@@ -361,7 +452,7 @@ def main(L: int = 128, use_meta: bool = True, seed: int = RANDOM_SEED):
         if val["macro_f1"] > best_f1:
             best_f1 = val["macro_f1"]
             best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
-            torch.save(best_state, os.path.join(MODELS_DIR, f"phase4_L{L}_best.pt"))
+            torch.save(best_state, os.path.join(MODELS_DIR, f"{tag}_best.pt"))
             patience = 0
             marker = " *"
         else:
@@ -388,17 +479,23 @@ def main(L: int = 128, use_meta: bool = True, seed: int = RANDOM_SEED):
         test["labels"], test["preds"], target_names=["fake", "real"], digits=4
     ))
 
+    breakdown = per_domain_breakdown(test["preds"], test["labels"], test["has_meta"])
+    if breakdown and len(breakdown) > 1:
+        print("PER-DOMAIN TEST METRICS")
+        for name, m in breakdown.items():
+            print(f"  {name:<5}  n={m['n']:>5}  acc={m['acc']:.4f}  macro_f1={m['macro_f1']:.4f}")
+
     # ----- Save rationale samples from test set -----
     model.eval()
     rat_dir = os.path.join(LOGS_DIR, "rationales_phase4")
     os.makedirs(rat_dir, exist_ok=True)
     with torch.no_grad():
         for batch in test_loader:
-            (feats, amask, em_m, mo_m, ne_m, y, meta) = _unpack(batch, use_meta, device)
-            out = model(feats, amask, em_m, mo_m, ne_m, meta)
+            (feats, amask, em_m, mo_m, ne_m, y, meta, has_meta) = _unpack(batch, use_meta, device)
+            out = model(feats, amask, em_m, mo_m, ne_m, meta, has_meta=has_meta)
             logits, em_s, mo_s, ne_s = out[0], out[1], out[2], out[3]
             batch_rats = generate_batch_rationales(em_s, mo_s, ne_s, logits)
-            out_path = os.path.join(rat_dir, f"sample_L{L}.txt")
+            out_path = os.path.join(rat_dir, f"sample_{tag}.txt")
             with open(out_path, "w") as f:
                 for i, (rat, _, _) in enumerate(batch_rats[:10]):
                     f.write(f"--- example {i+1} ---\n{rat}\n\n")
@@ -408,21 +505,23 @@ def main(L: int = 128, use_meta: bool = True, seed: int = RANDOM_SEED):
     # ----- Save final results -----
     results = {
         "phase": 4,
+        "dataset": dataset,
         "L": L,
         "use_meta": use_meta,
         "seed": seed,
         "best_val_macro_f1": best_f1,
         "test_acc": test["acc"],
         "test_macro_f1": test["macro_f1"],
+        "test_per_domain": breakdown,
         "n_params": n_params,
         "device": str(device),
         "em_mean": test["em_mean"],
         "mo_mean": test["mo_mean"],
         "ne_mean": test["ne_mean"],
     }
-    with open(os.path.join(RESULTS_DIR, f"phase4_L{L}_seed{seed}.json"), "w") as f:
+    with open(os.path.join(RESULTS_DIR, f"{tag}_seed{seed}.json"), "w") as f:
         json.dump(results, f, indent=2)
-    print(f"  results -> {RESULTS_DIR}/phase4_L{L}_seed{seed}.json")
+    print(f"  results -> {RESULTS_DIR}/{tag}_seed{seed}.json")
 
 
 if __name__ == "__main__":
@@ -430,5 +529,15 @@ if __name__ == "__main__":
     p.add_argument("--L", type=int, default=128)
     p.add_argument("--no-meta", action="store_true")
     p.add_argument("--seed", type=int, default=RANDOM_SEED)
+    p.add_argument(
+        "--dataset", choices=["liar", "merged"], default="liar",
+        help="liar = LIAR only (default); merged = joint LIAR + CoAID corpus.",
+    )
+    p.add_argument(
+        "--balance", action="store_true",
+        help="Use domain-balanced sampler (LIAR/CoAID x fake/real). "
+             "Recommended with --dataset merged.",
+    )
     args = p.parse_args()
-    main(L=args.L, use_meta=not args.no_meta, seed=args.seed)
+    main(L=args.L, use_meta=not args.no_meta, seed=args.seed,
+         dataset=args.dataset, balance=args.balance)

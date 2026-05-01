@@ -201,6 +201,7 @@ class CoTModel(nn.Module):
         modality_mask: torch.Tensor,
         negation_mask: torch.Tensor,
         metadata: torch.Tensor | None = None,
+        has_meta: torch.Tensor | None = None,
     ):
         # Backbone encode → post-LSTM+attention H and mean+max pool
         H, base_attn, pooled = self.backbone.encode(features, attention_mask)
@@ -213,7 +214,11 @@ class CoTModel(nn.Module):
         # Fuse
         parts = [pooled, em_ctx, mo_ctx, ne_ctx, em_score, mo_score, ne_score]
         if self.meta_proj is not None and metadata is not None:
-            parts.append(self.meta_proj(metadata))
+            # MetaEncoder accepts has_meta mask; legacy Linear branch does not.
+            if self.meta_vocabs is not None:
+                parts.append(self.meta_proj(metadata, has_meta=has_meta))
+            else:
+                parts.append(self.meta_proj(metadata))
         fused = torch.cat(parts, dim=-1)
         logits = self.classifier(fused)
 

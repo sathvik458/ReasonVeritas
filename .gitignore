@@ -1,6 +1,25 @@
+# existing
 venv/
 __pycache__/
 *.pyc
 data/
-
 gpu_env/.DS_Store
+
+.DS_Store
+
+# logs & experiment outputs
+logs/
+*.log
+*.csv
+
+# model weights
+models/
+*.pt
+*.pth
+
+# results
+results/
+*.json
+
+# misc temp
+*.txt

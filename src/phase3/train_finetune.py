@@ -42,6 +42,7 @@ from config import (
     TRAIN_WEIGHT_DECAY, TRAIN_NUM_EPOCHS, EARLY_STOP_PATIENCE,
     GRAD_CLIP_NORM, RANDOM_SEED, get_device,
 )
+from balanced_sampling import build_balanced_sampler, describe_buckets
 from meta_encoder import (
     PARTY_VOCAB, CREDIT_COLS, fit_metadata, encode_metadata, describe_vocabs,
 )
@@ -59,12 +60,20 @@ class TextDataset(Dataset):
         tokenizer,
         max_len: int,
         meta: np.ndarray | None = None,
+        has_meta: np.ndarray | None = None,
     ):
         df = pd.read_csv(split_csv)
         # Use the cleaned statement so we match Phase 1 normalization
         text_col = "clean_statement" if "clean_statement" in df.columns else "statement"
         texts = df[text_col].fillna("").astype(str).tolist()
-        labels = df["binary_label"].astype(int).tolist()
+        # binary_label may be a string ("fake"/"real") in merged splits.
+        bl = df["binary_label"]
+        # Handle both object/string types - check first value to determine if string labels
+        first_val = bl.iloc[0] if len(bl) > 0 else None
+        if first_val is not None and isinstance(first_val, str):
+            labels = [0 if str(b).lower() == "fake" else 1 for b in bl]
+        else:
+            labels = bl.astype(int).tolist()
 
         enc = tokenizer(
             texts,
@@ -77,6 +86,9 @@ class TextDataset(Dataset):
         self.attention_mask = enc["attention_mask"].long()           # (N, T)
         self.labels         = torch.tensor(labels, dtype=torch.long) # (N,)
         self.meta           = torch.from_numpy(meta).float() if meta is not None else None
+        self.has_meta       = (
+            torch.from_numpy(has_meta).float() if has_meta is not None else None
+        )
         if self.meta is not None:
             assert len(self.meta) == len(self.labels), \
                 f"meta {len(self.meta)} vs labels {len(self.labels)}"
@@ -86,7 +98,8 @@ class TextDataset(Dataset):
 
     def __getitem__(self, i):
         if self.meta is not None:
-            return self.input_ids[i], self.attention_mask[i], self.meta[i], self.labels[i]
+            hm = self.has_meta[i] if self.has_meta is not None else torch.tensor(1.0)
+            return self.input_ids[i], self.attention_mask[i], self.meta[i], hm, self.labels[i]
         return self.input_ids[i], self.attention_mask[i], self.labels[i]
 
 
@@ -116,35 +129,64 @@ class SmoothedCE(nn.Module):
 # ---------------------------------------------------------------------------
 def _step(batch, use_meta, device):
     if use_meta:
-        ids, amask, meta, y = batch
-        return (ids.to(device), amask.to(device), meta.to(device), y.to(device))
+        ids, amask, meta, has_meta, y = batch
+        return (ids.to(device), amask.to(device),
+                meta.to(device), has_meta.to(device), y.to(device))
     ids, amask, y = batch
-    return (ids.to(device), amask.to(device), None, y.to(device))
+    return (ids.to(device), amask.to(device), None, None, y.to(device))
 
 
 @torch.no_grad()
 def evaluate(model, loader, criterion, use_meta, device):
     model.eval()
-    losses, preds, ys = [], [], []
+    losses, preds, ys, hms = [], [], [], []
     for batch in loader:
-        ids, amask, meta, y = _step(batch, use_meta, device)
-        logits, _, _ = model(ids, amask, meta)
+        ids, amask, meta, has_meta, y = _step(batch, use_meta, device)
+        logits, _, _ = model(ids, amask, meta, has_meta=has_meta)
         losses.append(criterion(logits, y).item())
         preds.append(logits.argmax(dim=-1).cpu().numpy())
         ys.append(y.cpu().numpy())
+        if has_meta is not None:
+            hms.append(has_meta.cpu().numpy())
     preds = np.concatenate(preds); ys = np.concatenate(ys)
+    has_meta_arr = np.concatenate(hms) if hms else None
     return {
         "loss":     float(np.mean(losses)),
         "acc":      float(accuracy_score(ys, preds)),
         "macro_f1": float(f1_score(ys, preds, average="macro")),
         "preds":    preds,
         "labels":   ys,
+        "has_meta": has_meta_arr,
     }
+
+
+def per_domain_breakdown(preds, ys, has_meta_arr):
+    """LIAR (has_meta=1) vs CoAID (has_meta=0) acc / macro_f1."""
+    if has_meta_arr is None:
+        return None
+    out = {}
+    for name, mask_val in (("liar", 1.0), ("coaid", 0.0)):
+        m = (has_meta_arr == mask_val)
+        n = int(m.sum())
+        if n < 1:
+            continue
+        out[name] = {
+            "n":        n,
+            "acc":      float(accuracy_score(ys[m], preds[m])),
+            "macro_f1": float(f1_score(ys[m], preds[m], average="macro")),
+        }
+    return out
 
 
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
+def _split_csv(L: int, dataset: str, split: str) -> str:
+    if dataset == "liar":
+        return os.path.join(DATA_DIR, f"{split}_split_L{L}.csv")
+    return os.path.join(DATA_DIR, f"{dataset}_{split}_split_L{L}.csv")
+
+
 def main(
     L: int = 128,
     unfreeze_top_n: int = 2,
@@ -156,13 +198,15 @@ def main(
     head_lr: float = 5e-4,
     epochs: int = TRAIN_NUM_EPOCHS,
     dropout: float = 0.2,
+    dataset: str = "liar",
+    balance: bool = False,
 ):
     torch.manual_seed(seed); np.random.seed(seed)
     device = get_device()
     print(
         f"\nPhase 3 FINE-TUNE training "
-        f"(L={L}, unfreeze_top_n={unfreeze_top_n}, meta={use_meta}, "
-        f"seed={seed}, device={device})"
+        f"(dataset={dataset}, L={L}, unfreeze_top_n={unfreeze_top_n}, "
+        f"meta={use_meta}, seed={seed}, device={device})"
     )
 
     # ----- Load tokenizer once -----
@@ -172,10 +216,11 @@ def main(
     # ----- Metadata (fit on train only) -----
     meta_vocabs = None
     train_meta = val_meta = test_meta = None
+    train_has = val_has = test_has = None
     if use_meta:
-        train_csv_df = pd.read_csv(os.path.join(DATA_DIR, f"train_split_L{L}.csv"))
-        val_csv_df   = pd.read_csv(os.path.join(DATA_DIR, f"val_split_L{L}.csv"))
-        test_csv_df  = pd.read_csv(os.path.join(DATA_DIR, f"test_split_L{L}.csv"))
+        train_csv_df = pd.read_csv(_split_csv(L, dataset, "train"))
+        val_csv_df   = pd.read_csv(_split_csv(L, dataset, "val"))
+        test_csv_df  = pd.read_csv(_split_csv(L, dataset, "test"))
         meta_vocabs, scaler = fit_metadata(train_csv_df)
         train_meta = encode_metadata(train_csv_df, meta_vocabs, scaler)
         val_meta   = encode_metadata(val_csv_df,   meta_vocabs, scaler)
@@ -186,20 +231,47 @@ def main(
         )
         print(f"  vocabs: {describe_vocabs(meta_vocabs)}")
 
+        if "has_meta" in train_csv_df.columns:
+            train_has = train_csv_df["has_meta"].astype(np.float32).values
+            val_has   = val_csv_df["has_meta"].astype(np.float32).values
+            test_has  = test_csv_df["has_meta"].astype(np.float32).values
+            print(f"  has_meta:    train={train_has.mean():.3f}  "
+                  f"val={val_has.mean():.3f}  test={test_has.mean():.3f}")
+        else:
+            train_has = np.ones(len(train_csv_df), dtype=np.float32)
+            val_has   = np.ones(len(val_csv_df),   dtype=np.float32)
+            test_has  = np.ones(len(test_csv_df),  dtype=np.float32)
+
     # ----- Datasets / loaders -----
-    def ds(split, meta):
+    def ds(split, meta, has):
         return TextDataset(
-            split_csv=os.path.join(DATA_DIR, f"{split}_split_L{L}.csv"),
+            split_csv=_split_csv(L, dataset, split),
             tokenizer=tokenizer,
             max_len=BERT_MAX_LEN,
             meta=meta,
+            has_meta=has,
         )
-    train_ds = ds("train", train_meta)
-    val_ds   = ds("val",   val_meta)
-    test_ds  = ds("test",  test_meta)
+    train_ds = ds("train", train_meta, train_has)
+    val_ds   = ds("val",   val_meta,   val_has)
+    test_ds  = ds("test",  test_meta,  test_has)
     print(f"  train={len(train_ds)} val={len(val_ds)} test={len(test_ds)}  batch={batch_size} (×{grad_accum} accum)")
 
-    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
+    sampler = None
+    if balance:
+        sampler = build_balanced_sampler(
+            has_meta=train_has,
+            labels=train_ds.labels.numpy(),
+        )
+        if sampler is None:
+            print("  [balance] only one (domain, class) bucket present — falling back to shuffle.")
+        else:
+            print(f"  [balance] domain-balanced sampler enabled. "
+                  f"Train buckets: {describe_buckets(train_has, train_ds.labels.numpy())}")
+
+    if sampler is None:
+        train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
+    else:
+        train_loader = DataLoader(train_ds, batch_size=batch_size, sampler=sampler)
     val_loader   = DataLoader(val_ds,   batch_size=batch_size)
     test_loader  = DataLoader(test_ds,  batch_size=batch_size)
 
@@ -245,7 +317,8 @@ def main(
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
     # ----- Logging -----
-    tag = f"phase3_finetune_L{L}_uf{unfreeze_top_n}"
+    ds_suffix = "" if dataset == "liar" else f"_{dataset}"
+    tag = f"phase3_finetune{ds_suffix}_L{L}_uf{unfreeze_top_n}"
     log_path = os.path.join(LOGS_DIR, f"{tag}.csv")
     with open(log_path, "w", newline="") as f:
         csv.writer(f).writerow(
@@ -258,8 +331,8 @@ def main(
         train_losses = []
         optimizer.zero_grad()
         for step, batch in enumerate(train_loader):
-            ids, amask, meta, y = _step(batch, use_meta, device)
-            logits, _, _ = model(ids, amask, meta)
+            ids, amask, meta, has_meta, y = _step(batch, use_meta, device)
+            logits, _, _ = model(ids, amask, meta, has_meta=has_meta)
             loss = criterion(logits, y) / grad_accum
             loss.backward()
             train_losses.append(loss.item() * grad_accum)
@@ -310,14 +383,22 @@ def main(
         test["labels"], test["preds"], target_names=["fake", "real"], digits=4
     ))
 
+    breakdown = per_domain_breakdown(test["preds"], test["labels"], test["has_meta"])
+    if breakdown and len(breakdown) > 1:
+        print("PER-DOMAIN TEST METRICS")
+        for name, m in breakdown.items():
+            print(f"  {name:<5}  n={m['n']:>5}  acc={m['acc']:.4f}  macro_f1={m['macro_f1']:.4f}")
+
     # ----- Save final results -----
     results = {
         "phase": 3,
         "variant": "finetune",
+        "dataset": dataset,
         "L": L,
         "unfreeze_top_n": unfreeze_top_n,
         "use_meta": use_meta,
         "seed": seed,
+        "test_per_domain": breakdown,
         "best_val_macro_f1": best_f1,
         "test_acc": test["acc"],
         "test_macro_f1": test["macro_f1"],
@@ -346,6 +427,15 @@ if __name__ == "__main__":
     p.add_argument("--head_lr", type=float, default=5e-4)
     p.add_argument("--epochs", type=int, default=TRAIN_NUM_EPOCHS)
     p.add_argument("--dropout", type=float, default=0.2)
+    p.add_argument(
+        "--dataset", choices=["liar", "merged"], default="liar",
+        help="liar = LIAR only (default); merged = joint LIAR + CoAID corpus.",
+    )
+    p.add_argument(
+        "--balance", action="store_true",
+        help="Use domain-balanced sampler (LIAR/CoAID x fake/real). "
+             "Recommended with --dataset merged.",
+    )
     args = p.parse_args()
     main(
         L=args.L,
@@ -358,4 +448,6 @@ if __name__ == "__main__":
         head_lr=args.head_lr,
         epochs=args.epochs,
         dropout=args.dropout,
+        dataset=args.dataset,
+        balance=args.balance,
     )

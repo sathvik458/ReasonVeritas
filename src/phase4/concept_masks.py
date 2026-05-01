@@ -123,10 +123,29 @@ def cache_subword_masks(
     bert_max_len: int,
     overwrite: bool = False,
 ):
-    """Compute + cache subword masks for a split (saves ~(N, T)×3 float32)."""
+    """Compute + cache subword masks for a split (saves ~(N, T)×3 float32).
+
+    Auto-invalidates the cache if the existing file's row count or T-dim
+    doesn't match the current features_npz / split_csv. This catches the
+    case where the underlying corpus changed (e.g. CoAID news added to
+    the merged splits) but the old mask file still exists.
+    """
     if os.path.exists(out_npz) and not overwrite:
-        print(f"[concept_masks] cache exists, skipping: {out_npz}")
-        return
+        try:
+            existing = np.load(out_npz, allow_pickle=False)
+            existing_n, existing_t = existing["emotion"].shape
+            ref = np.load(features_npz, allow_pickle=False)
+            ref_n, ref_t = ref["features"].shape[:2]
+        except Exception as e:
+            print(f"[concept_masks] could not validate {out_npz} ({e}) — rebuilding")
+        else:
+            if existing_n == ref_n and existing_t == ref_t and existing_t == bert_max_len:
+                print(f"[concept_masks] cache exists, skipping: {out_npz}")
+                return
+            print(
+                f"[concept_masks] cache stale: {out_npz} has shape "
+                f"({existing_n}, {existing_t}) but features have ({ref_n}, {ref_t}) — rebuilding"
+            )
     masks = build_subword_masks_for_split(split_csv, features_npz, bert_max_len)
     os.makedirs(os.path.dirname(out_npz), exist_ok=True)
     np.savez_compressed(out_npz, **masks)

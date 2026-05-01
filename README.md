@@ -31,7 +31,7 @@ The earlier README only documented Phase 1 and Phase 2. This version adds Phase 
 - **Phase 4 added.** Same backbone with three concept-gated attention heads (Emotion / Modality+scope / Negation+scope), auxiliary multi-task losses, and template + attention-grounded rationales.
 - **Gated auxiliary loss (dead-head fix).** Each concept head's auxiliary classifier is now trained only on examples where the corresponding concept is actually present in the input. This fixed the "dead emotion head" problem (`E_mean ≈ 0.04`) we saw with flat aux loss.
 - **Attention-grounded rationales.** `src/phase4/rationale.py` now also emits the top-K subword tokens each concept head attended to, decoded via the tokenizer. Sample dump in `logs/rationales_phase4*/`.
-- **End-to-end fine-tune branch.** `train_finetune.py` (Phase 3) and `train_phase4_finetune.py` (Phase 4) unfreeze the top-N DistilBERT transformer blocks for full end-to-end training (ULMFiT-style two-group LR). See `FINETUNE_README.md` for the M3 Pro quick start.
+- **End-to-end fine-tune branch.** `train_finetune.py` (Phase 3) and `train_phase4_finetune.py` (Phase 4) unfreeze the top-N DistilBERT transformer blocks for full end-to-end training (ULMFiT-style two-group LR). See `FINETUNE_README.md` a quick start.
 
 ---
 
@@ -55,7 +55,11 @@ Reasonveritas/
 │   ├── train_eval_variants_step8_L128.csv
 │   ├── bert_features_{train,val,test}_L128.npz   # Phase 2 step 3 (DistilBERT)
 │   ├── subword_to_word_{train,val,test}_L128.npz # Phase 2 step 3 (alignment)
-│   └── concept_masks_{train,val,test}_L128.npz   # built lazily by Phase 4
+│   ├── concept_masks_{train,val,test}_L128.npz   # built lazily by Phase 4
+│   ├── coaid/                                    # CoAID Claim CSVs (download_datasets.py)
+│   ├── coaid_concepts_step6_L128.csv             # CoAID Phase 1 output (prepare_coaid.py)
+│   ├── merged_{train,val,test}_split_L128.csv    # LIAR+CoAID joint splits (merge_datasets.py)
+│   └── bert_features_merged_{train,val,test}_L128.npz  # joint BERT cache
 ├── models/                    # Saved checkpoints (best val macro-F1)
 │   ├── phase3_L128_best.pt, phase3_finetune_L128_uf2_best.pt
 │   └── phase4_L128_best.pt,  phase4_finetune_L128_uf2_best.pt
@@ -66,6 +70,8 @@ Reasonveritas/
     ├── meta_encoder.py        # Party + credit + speaker/subject/context embeddings
     ├── utils_logger.py
     ├── phase1/                # Dataset + preprocessing (steps 1–8)
+    │   ├── prepare_coaid.py        # Self-contained CoAID Phase 1 pipeline
+    │   └── merge_datasets.py       # Build LIAR + CoAID joint splits
     ├── phase2/                # Reasoning tokens + vocab (legacy) + BERT features (current)
     │   ├── step1_retokenize.py
     │   ├── step2_vocabulary_encoding.py
@@ -148,6 +154,119 @@ python src/phase3/train_model.py --L 128
 python src/phase4/train_phase4.py  --L 128
 ```
 
+---
+
+## Cross-domain training (LIAR + CoAID)
+
+The `coaid-dataset-implementation` branch adds a second corpus — Cui & Lee's CoAID — and lets you train a single joint model on the union of LIAR (political claims) + CoAID (health claims). Same architecture, same trainers, just `--dataset merged`.
+
+**Why joint training:** out-of-domain robustness. A LIAR-only model is fluent in political evasion patterns but has never seen a single COVID claim. A CoAID-only model has the inverse blind spot. Training on both forces the concept-gated heads to find domain-agnostic emotion / modality / negation signals instead of memorizing speakers.
+
+**What's pulled from CoAID:** both the **Claim** subset (short factual claims) and the **News** subset (article headlines — only the `title` column, not the full article body). Title-level use keeps inputs short enough for L=128 and stylistically close to LIAR statements. We strip leading verdict-like prefixes (`FAKE:`, `FALSE:`, `DEBUNKED:`, `FACT-CHECK:`, `HOAX:`, `MYTH:`, etc.) from CoAID news headlines before tokenization so the classifier can't shortcut on them.
+
+**One-time setup**
+
+```bash
+# 1. Download CoAID CSVs — 16 files (4 snapshots × {ClaimReal, ClaimFake, NewsReal, NewsFake}, ~5 MB total)
+python data/download_datasets.py
+
+# 2. CoAID Phase 1: clean → normalize → tokenize → truncate (L=128) → concept-tag
+#    Auto-detects claim vs news from filename, strips label-leak prefixes, dedupes across snapshots.
+python src/phase1/prepare_coaid.py
+# Output: data/coaid_concepts_step6_L128.csv  (with coaid_subset column = "claim" | "news")
+
+# 3. Merge LIAR + CoAID into joint train/val/test splits with dataset_source + has_meta columns,
+#    stratified on (binary_label, dataset_source) so every split has proportional CoAID coverage.
+python src/phase1/merge_datasets.py
+# Outputs: data/merged_{train,val,test}_split_L128.csv
+
+# 4. Re-cache DistilBERT contextual features over the merged splits
+python src/phase2/step3_embeddings.py --dataset merged --L 128
+# Outputs: data/bert_features_merged_{train,val,test}_L128.npz
+```
+
+### Joint training
+
+Each trainer accepts `--dataset merged` and `--balance`. The recommended joint-training command for paper numbers is:
+
+```bash
+# Phase 3 frozen baseline (joint corpus, balanced sampler) — ~5 min on M2 Air
+python src/phase3/train_model.py        --L 128 --dataset merged --balance
+
+# Phase 4 CoT head (joint corpus, balanced sampler) — ~5 min
+python src/phase4/train_phase4.py       --L 128 --dataset merged --balance
+
+# End-to-end fine-tuned variants (~30–60 min on M3 Pro 36 GB each)
+python src/phase3/train_finetune.py        --L 128 --unfreeze 2 --dataset merged --balance
+python src/phase4/train_phase4_finetune.py --L 128 --unfreeze 2 --dataset merged --balance
+```
+
+Outputs are tagged with the dataset:
+- `results/phase{3,4}_merged_L128_seed42.json`
+- `models/phase{3,4}_merged_L128_best.pt`
+- `logs/phase{3,4}_merged_L128_train.csv`
+- Fine-tune runs use `phase{3,4}_finetune_merged_L128_uf{N}_*`.
+
+The test report ends with a per-domain breakdown so you see LIAR-only and CoAID-only acc / macro-F1, not just the aggregate:
+
+```
+PER-DOMAIN TEST METRICS
+  liar   n=1916  acc=0.6XX  macro_f1=0.6XX
+  coaid  n=  XX  acc=0.X    macro_f1=0.X
+```
+
+### `--balance` (domain-balanced sampler)
+
+Without it: ~96% of every batch is LIAR, ~4% CoAID. With CoAID's class-imbalance (real ≫ fake), the fake CoAID rows are essentially invisible during training.
+
+With `--balance`: `WeightedRandomSampler` weights each row by `1 / count_of_(dataset_source, binary_label)_bucket` so each batch contains a balanced mix of `liar/fake`, `liar/real`, `coaid/fake`, `coaid/real`. Strongly recommended whenever `--dataset merged`.
+
+### `has_meta` per-row mask (no fake metadata for CoAID)
+
+LIAR rows carry speaker / party / credit-history / subject / context; CoAID rows don't. Rather than fabricate values:
+- `prepare_coaid.py` writes empty strings / 0 for the missing columns and tags rows `has_meta = 0`.
+- `merge_datasets.py` propagates `has_meta` per row (1 = LIAR, 0 = CoAID).
+- `MetaEncoder.fit_metadata()` only fits the speaker/subject/context vocabs and the credit scaler on `has_meta == 1` rows so CoAID's empties can't poison vocab top-K.
+- `MetaEncoder.forward(meta, has_meta=mask)` zeroes the metadata branch for `has_meta == 0` rows. The classifier sees an all-zero metadata slot for CoAID, never a noisy fake one.
+- All four trainers thread `has_meta` end-to-end. With `--dataset liar` (default) `has_meta` is all-ones and behavior is unchanged.
+
+### Multi-seed runs (paper numbers)
+
+Run three seeds and report mean ± std. Add this loop after the joint corpus is built:
+
+```bash
+for s in 41 42 43; do
+  python src/phase3/train_model.py        --L 128 --dataset merged --balance --seed $s
+  python src/phase4/train_phase4.py       --L 128 --dataset merged --balance --seed $s
+done
+
+# Fine-tune (M3 Pro)
+for s in 41 42 43; do
+  python src/phase3/train_finetune.py        --L 128 --unfreeze 2 --dataset merged --balance --seed $s
+  python src/phase4/train_phase4_finetune.py --L 128 --unfreeze 2 --dataset merged --balance --seed $s
+done
+```
+
+Each run writes `results/<tag>_seed<S>.json` with `test_acc`, `test_macro_f1`, and `test_per_domain.{liar,coaid}.{n,acc,macro_f1}`. Aggregate them with this one-liner:
+
+```bash
+python3 -c "
+import json, glob, statistics as s
+files = sorted(glob.glob('results/phase4_finetune_merged_L128_uf2_seed*.json'))
+fs = [json.load(open(f))['test_macro_f1'] for f in files]
+print(f'macro_f1 = {s.mean(fs):.4f} ± {s.stdev(fs):.4f}  (n={len(fs)})')
+"
+```
+
+### Recommended ablation table for the paper
+
+| Run | Frozen LIAR-only | Frozen merged + balance | Fine-tuned LIAR-only | Fine-tuned merged + balance |
+|---|---|---|---|---|
+| Phase 3 | `--L 128` | `--L 128 --dataset merged --balance` | `--L 128 --unfreeze 2` | `--L 128 --unfreeze 2 --dataset merged --balance` |
+| Phase 4 | `--L 128` | `--L 128 --dataset merged --balance` | `--L 128 --unfreeze 2` | `--L 128 --unfreeze 2 --dataset merged --balance` |
+
+Each row × 3 seeds = 12 runs per phase. Report mean ± std and per-domain breakdown.
+
 Or alternatively, run all of Phase 1 in one shot:
 
 ```bash
@@ -208,7 +327,7 @@ Phase 3 trains the strong baseline: DistilBERT features → BiLSTM → multi-hea
 - Batch 32, ~10 epochs with early stop on val macro-F1.
 - Best checkpoint → `models/phase3_L128_best.pt`. Test JSON → `results/phase3_L128_seed42.json`.
 
-**Run (frozen baseline, ~5 min on M2 Air)**
+**Run (Run this when ram is less than 32gb)**
 
 ```bash
 python src/phase3/train_model.py --L 128
@@ -225,8 +344,7 @@ Reference number: **macro-F1 ≈ 0.633** on the LIAR test split (seed 42).
 - Linear warmup (10%) + linear decay floored at 0.1.
 - Gradient accumulation: defaults `--batch 16 --accum 2` → effective batch 32. Drop to `--batch 8 --accum 4` if you OOM.
 
-**Run (~30–45 min on M3 Pro 36 GB)**
-
+**Run this when ram is above 32gb**
 ```bash
 python src/phase3/train_finetune.py --L 128 --unfreeze 2
 ```
@@ -260,7 +378,7 @@ The masks come from Phase 1 step 6's lexicon-based concept mapping and are align
 - Per-step rationale generation via `rationale.generate_rationale` (template-based: maps scores to a fixed reasoning sentence).
 - Best checkpoint → `models/phase4_L128_best.pt`. Test JSON → `results/phase4_L128_seed42.json`.
 
-**Run (frozen baseline, ~5 min on M2 Air)**
+**Run (Run this when ram is less than 32gb)**
 
 ```bash
 python src/phase4/train_phase4.py --L 128
@@ -278,7 +396,7 @@ Reference number: **macro-F1 ≈ 0.631** on the LIAR test split (seed 42).
 
 The attention-grounded rationale is what makes the paper's "faithful reasoning" claim substantiable: each step cites the actual tokens the head attended to with their attention weights, not just a templated score-to-text mapping.
 
-**Run (~45–60 min on M3 Pro 36 GB)**
+**use this only when ram is more than 32gb**
 
 ```bash
 python src/phase4/train_phase4_finetune.py --L 128 --unfreeze 2

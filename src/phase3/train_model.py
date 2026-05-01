@@ -41,6 +41,7 @@ from meta_encoder import (
     PARTY_VOCAB, CREDIT_COLS, META_TOTAL_DIM,
     fit_metadata, encode_metadata, describe_vocabs,
 )
+from balanced_sampling import build_balanced_sampler, describe_buckets
 
 sys.path.insert(0, os.path.join(_src, "phase3"))
 from bilstm_attention import BiLSTMAttention
@@ -69,23 +70,38 @@ def build_metadata(
 # Dataset
 # ---------------------------------------------------------------------------
 class CachedFeatureDataset(Dataset):
-    def __init__(self, npz_path: str, meta: np.ndarray | None = None):
+    def __init__(
+        self,
+        npz_path: str,
+        meta: np.ndarray | None = None,
+        has_meta: np.ndarray | None = None,
+    ):
         d = load_features(npz_path)
         self.features = torch.from_numpy(d["features"])
         self.attn     = torch.from_numpy(d["attention_mask"]).long()
         self.labels   = torch.from_numpy(d["labels"]).long()
         self.meta     = torch.from_numpy(meta).float() if meta is not None else None
+        # has_meta is a (N,) {0,1} mask. When meta is disabled or every row has
+        # metadata, it's left as None and the model treats every row as fully
+        # metadata-bearing. We force it on for the merged LIAR + CoAID corpus.
+        self.has_meta = (
+            torch.from_numpy(has_meta).float() if has_meta is not None else None
+        )
         assert len(self.features) == len(self.labels)
         if self.meta is not None:
             assert len(self.meta) == len(self.features), \
                 f"meta {len(self.meta)} vs features {len(self.features)}"
+        if self.has_meta is not None:
+            assert len(self.has_meta) == len(self.features), \
+                f"has_meta {len(self.has_meta)} vs features {len(self.features)}"
 
     def __len__(self):
         return len(self.labels)
 
     def __getitem__(self, i):
         if self.meta is not None:
-            return self.features[i], self.attn[i], self.meta[i], self.labels[i]
+            hm = self.has_meta[i] if self.has_meta is not None else torch.tensor(1.0)
+            return self.features[i], self.attn[i], self.meta[i], hm, self.labels[i]
         return self.features[i], self.attn[i], self.labels[i]
 
 
@@ -110,62 +126,114 @@ class FocalLoss(nn.Module):
 # ---------------------------------------------------------------------------
 def _step_batch(batch, use_meta, device):
     if use_meta:
-        feats, mask, meta, y = batch
-        return (feats.to(device), mask.to(device), meta.to(device), y.to(device))
+        feats, mask, meta, has_meta, y = batch
+        return (
+            feats.to(device), mask.to(device),
+            meta.to(device), has_meta.to(device),
+            y.to(device),
+        )
     feats, mask, y = batch
-    return (feats.to(device), mask.to(device), None, y.to(device))
+    return (feats.to(device), mask.to(device), None, None, y.to(device))
 
 
 @torch.no_grad()
 def evaluate(model, loader, criterion, use_meta, device):
     model.eval()
-    losses, preds, ys = [], [], []
+    losses, preds, ys, hms = [], [], [], []
     for batch in loader:
-        feats, mask, meta, y = _step_batch(batch, use_meta, device)
-        logits, _, _ = model(feats, mask, meta)
+        feats, mask, meta, has_meta, y = _step_batch(batch, use_meta, device)
+        logits, _, _ = model(feats, mask, meta, has_meta=has_meta)
         losses.append(criterion(logits, y).item())
         preds.append(logits.argmax(dim=-1).cpu().numpy())
         ys.append(y.cpu().numpy())
+        if has_meta is not None:
+            hms.append(has_meta.cpu().numpy())
     preds = np.concatenate(preds)
     ys = np.concatenate(ys)
+    has_meta_arr = np.concatenate(hms) if hms else None
     return {
         "loss":     float(np.mean(losses)),
         "acc":      float(accuracy_score(ys, preds)),
         "macro_f1": float(f1_score(ys, preds, average="macro")),
         "preds":    preds,
         "labels":   ys,
+        "has_meta": has_meta_arr,
     }
+
+
+def per_domain_breakdown(preds, ys, has_meta_arr):
+    """Split predictions by has_meta (1 = LIAR, 0 = CoAID) and compute per-domain metrics."""
+    if has_meta_arr is None:
+        return None
+    out = {}
+    for name, mask_val in (("liar", 1.0), ("coaid", 0.0)):
+        m = (has_meta_arr == mask_val)
+        n = int(m.sum())
+        if n < 1:
+            continue
+        out[name] = {
+            "n":        n,
+            "acc":      float(accuracy_score(ys[m], preds[m])),
+            "macro_f1": float(f1_score(ys[m], preds[m], average="macro")),
+        }
+    return out
 
 
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
-def main(L: int = 128, use_meta: bool = True, seed: int = RANDOM_SEED):
+def _paths(L: int, dataset: str) -> dict:
+    """Build all dataset-aware file paths in one place."""
+    if dataset == "liar":
+        feat_pre = "bert_features"
+        split_pre = ""        # train_split_L128.csv
+    else:                     # "merged" (or future: "coaid")
+        feat_pre = f"bert_features_{dataset}"
+        split_pre = f"{dataset}_"  # merged_train_split_L128.csv
+    return {
+        "feat_train": os.path.join(DATA_DIR, f"{feat_pre}_train_L{L}.npz"),
+        "feat_val":   os.path.join(DATA_DIR, f"{feat_pre}_val_L{L}.npz"),
+        "feat_test":  os.path.join(DATA_DIR, f"{feat_pre}_test_L{L}.npz"),
+        "csv_train":  os.path.join(DATA_DIR, f"{split_pre}train_split_L{L}.csv"),
+        "csv_val":    os.path.join(DATA_DIR, f"{split_pre}val_split_L{L}.csv"),
+        "csv_test":   os.path.join(DATA_DIR, f"{split_pre}test_split_L{L}.csv"),
+    }
+
+
+def main(
+    L: int = 128,
+    use_meta: bool = True,
+    seed: int = RANDOM_SEED,
+    dataset: str = "liar",
+    balance: bool = False,
+):
     torch.manual_seed(seed)
     np.random.seed(seed)
     device = get_device()
-    print(f"\nPhase 3 training (L={L}, meta={use_meta}, seed={seed}, device={device})")
+    print(f"\nPhase 3 training (dataset={dataset}, L={L}, meta={use_meta}, seed={seed}, device={device})")
 
     # ----- Load cached BERT features -----
-    feat_train = os.path.join(DATA_DIR, f"bert_features_train_L{L}.npz")
-    feat_val   = os.path.join(DATA_DIR, f"bert_features_val_L{L}.npz")
-    feat_test  = os.path.join(DATA_DIR, f"bert_features_test_L{L}.npz")
-    for p in (feat_train, feat_val, feat_test):
+    paths = _paths(L, dataset)
+    for p in (paths["feat_train"], paths["feat_val"], paths["feat_test"]):
         if not os.path.exists(p):
+            hint = "python src/phase2/step3_embeddings.py"
+            if dataset != "liar":
+                hint += f" --dataset {dataset}"
             raise FileNotFoundError(
-                f"Missing {p}. Run Phase 2 step 3 first:\n"
-                f"  python src/phase2/step3_embeddings.py"
+                f"Missing {p}. Run Phase 2 step 3 first:\n  {hint}"
             )
 
     # ----- Metadata (read split CSVs to align row order with features) -----
     meta_dim = 0
     meta_vocabs = None
     train_meta = val_meta = test_meta = None
+    train_has = val_has = test_has = None
     if use_meta:
-        train_csv = pd.read_csv(os.path.join(DATA_DIR, f"train_split_L{L}.csv"))
-        val_csv   = pd.read_csv(os.path.join(DATA_DIR, f"val_split_L{L}.csv"))
-        test_csv  = pd.read_csv(os.path.join(DATA_DIR, f"test_split_L{L}.csv"))
+        train_csv = pd.read_csv(paths["csv_train"])
+        val_csv   = pd.read_csv(paths["csv_val"])
+        test_csv  = pd.read_csv(paths["csv_test"])
         # FIT on train only (no leakage), reuse on val/test
+        # (fit_metadata internally restricts to has_meta == 1 if column present)
         train_meta, meta_vocabs, scaler = build_metadata(train_csv)
         val_meta,   _,           _      = build_metadata(val_csv,  meta_vocabs, scaler)
         test_meta,  _,           _      = build_metadata(test_csv, meta_vocabs, scaler)
@@ -173,12 +241,40 @@ def main(L: int = 128, use_meta: bool = True, seed: int = RANDOM_SEED):
         print(f"  metadata dim = {meta_dim} (party 7 + credit 5 + speaker/subject/context idx)")
         print(f"  vocabs: {describe_vocabs(meta_vocabs)}")
 
-    # ----- Datasets / loaders -----
-    train_ds = CachedFeatureDataset(feat_train, train_meta)
-    val_ds   = CachedFeatureDataset(feat_val,   val_meta)
-    test_ds  = CachedFeatureDataset(feat_test,  test_meta)
+        # Per-row has_meta mask. Default = all 1s (LIAR), 0s for CoAID rows in merged.
+        if "has_meta" in train_csv.columns:
+            train_has = train_csv["has_meta"].astype(np.float32).values
+            val_has   = val_csv["has_meta"].astype(np.float32).values
+            test_has  = test_csv["has_meta"].astype(np.float32).values
+            print(f"  has_meta:    train fraction with metadata = "
+                  f"{train_has.mean():.3f}  val = {val_has.mean():.3f}  test = {test_has.mean():.3f}")
+        else:
+            train_has = np.ones(len(train_csv), dtype=np.float32)
+            val_has   = np.ones(len(val_csv),   dtype=np.float32)
+            test_has  = np.ones(len(test_csv),  dtype=np.float32)
 
-    train_loader = DataLoader(train_ds, batch_size=TRAIN_BATCH_SIZE, shuffle=True)
+    # ----- Datasets / loaders -----
+    train_ds = CachedFeatureDataset(paths["feat_train"], train_meta, train_has)
+    val_ds   = CachedFeatureDataset(paths["feat_val"],   val_meta,   val_has)
+    test_ds  = CachedFeatureDataset(paths["feat_test"],  test_meta,  test_has)
+
+    # Optional domain-balanced sampler for the joint LIAR + CoAID corpus.
+    sampler = None
+    if balance:
+        sampler = build_balanced_sampler(
+            has_meta=train_has,
+            labels=train_ds.labels.numpy(),
+        )
+        if sampler is None:
+            print("  [balance] only one (domain, class) bucket present — falling back to shuffle.")
+        else:
+            print(f"  [balance] domain-balanced sampler enabled. "
+                  f"Train buckets: {describe_buckets(train_has, train_ds.labels.numpy())}")
+
+    if sampler is None:
+        train_loader = DataLoader(train_ds, batch_size=TRAIN_BATCH_SIZE, shuffle=True)
+    else:
+        train_loader = DataLoader(train_ds, batch_size=TRAIN_BATCH_SIZE, sampler=sampler)
     val_loader   = DataLoader(val_ds,   batch_size=TRAIN_BATCH_SIZE)
     test_loader  = DataLoader(test_ds,  batch_size=TRAIN_BATCH_SIZE)
 
@@ -249,7 +345,8 @@ def main(L: int = 128, use_meta: bool = True, seed: int = RANDOM_SEED):
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
     # ----- Training loop -----
-    log_path = os.path.join(LOGS_DIR, f"phase3_train_L{L}.csv")
+    tag = f"phase3_L{L}" if dataset == "liar" else f"phase3_{dataset}_L{L}"
+    log_path = os.path.join(LOGS_DIR, f"{tag}_train.csv")
     with open(log_path, "w", newline="") as f:
         csv.writer(f).writerow(
             ["epoch", "train_loss", "val_loss", "val_acc", "val_macro_f1", "lr"]
@@ -260,9 +357,9 @@ def main(L: int = 128, use_meta: bool = True, seed: int = RANDOM_SEED):
         model.train()
         train_losses = []
         for batch in train_loader:
-            feats, mask, meta, y = _step_batch(batch, use_meta, device)
+            feats, mask, meta, has_meta, y = _step_batch(batch, use_meta, device)
             optimizer.zero_grad()
-            logits, _, _ = model(feats, mask, meta)
+            logits, _, _ = model(feats, mask, meta, has_meta=has_meta)
             loss = criterion(logits, y)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP_NORM)
@@ -288,7 +385,7 @@ def main(L: int = 128, use_meta: bool = True, seed: int = RANDOM_SEED):
         if val["macro_f1"] > best_f1:
             best_f1 = val["macro_f1"]
             best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
-            torch.save(best_state, os.path.join(MODELS_DIR, f"phase3_L{L}_best.pt"))
+            torch.save(best_state, os.path.join(MODELS_DIR, f"{tag}_best.pt"))
             patience = 0
             msg += "  *"
         else:
@@ -308,21 +405,31 @@ def main(L: int = 128, use_meta: bool = True, seed: int = RANDOM_SEED):
         test["labels"], test["preds"], target_names=["fake", "real"], digits=4
     ))
 
+    # Per-domain breakdown (only meaningful for the merged corpus where
+    # has_meta varies — LIAR rows = 1, CoAID rows = 0).
+    breakdown = per_domain_breakdown(test["preds"], test["labels"], test["has_meta"])
+    if breakdown and len(breakdown) > 1:
+        print("PER-DOMAIN TEST METRICS")
+        for name, m in breakdown.items():
+            print(f"  {name:<5}  n={m['n']:>5}  acc={m['acc']:.4f}  macro_f1={m['macro_f1']:.4f}")
+
     # ----- Save final results JSON -----
     results = {
         "phase": 3,
+        "dataset": dataset,
         "L": L,
         "use_meta": use_meta,
         "seed": seed,
         "best_val_macro_f1": best_f1,
         "test_acc": test["acc"],
         "test_macro_f1": test["macro_f1"],
+        "test_per_domain": breakdown,
         "n_params": n_params,
         "device": str(device),
     }
-    with open(os.path.join(RESULTS_DIR, f"phase3_L{L}_seed{seed}.json"), "w") as f:
+    with open(os.path.join(RESULTS_DIR, f"{tag}_seed{seed}.json"), "w") as f:
         json.dump(results, f, indent=2)
-    print(f"  results -> {RESULTS_DIR}/phase3_L{L}_seed{seed}.json")
+    print(f"  results -> {RESULTS_DIR}/{tag}_seed{seed}.json")
 
 
 if __name__ == "__main__":
@@ -330,5 +437,15 @@ if __name__ == "__main__":
     p.add_argument("--L", type=int, default=128)
     p.add_argument("--no-meta", action="store_true", help="disable metadata branch")
     p.add_argument("--seed", type=int, default=RANDOM_SEED)
+    p.add_argument(
+        "--dataset", choices=["liar", "merged"], default="liar",
+        help="liar = LIAR only (default); merged = joint LIAR + CoAID corpus.",
+    )
+    p.add_argument(
+        "--balance", action="store_true",
+        help="Use domain-balanced sampler (LIAR/CoAID x fake/real). "
+             "Recommended with --dataset merged.",
+    )
     args = p.parse_args()
-    main(L=args.L, use_meta=not args.no_meta, seed=args.seed)
+    main(L=args.L, use_meta=not args.no_meta, seed=args.seed,
+         dataset=args.dataset, balance=args.balance)

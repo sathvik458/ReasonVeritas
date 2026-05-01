@@ -96,6 +96,7 @@ class CoTModelFineTune(nn.Module):
         modality_mask: torch.Tensor,
         negation_mask: torch.Tensor,
         metadata: torch.Tensor | None = None,
+        has_meta: torch.Tensor | None = None,
     ):
         out = self.bert(input_ids=input_ids, attention_mask=attention_mask)
         features = out.last_hidden_state                  # (B, T, 768)
@@ -103,4 +104,5 @@ class CoTModelFineTune(nn.Module):
             features, attention_mask,
             emotion_mask, modality_mask, negation_mask,
             metadata,
+            has_meta=has_meta,
         )

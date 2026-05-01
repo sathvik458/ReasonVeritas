@@ -21,6 +21,7 @@ Run after Phase 1 + Phase 2 step 1/2.  Idempotent (skips cached files).
 """
 from __future__ import annotations
 
+import argparse
 import os
 import sys
 import ast
@@ -36,27 +37,59 @@ LABEL_MAP = {"fake": 0, "real": 1}
 SPLITS = ["train", "val", "test"]
 
 
-def _load_split(L: int, split: str) -> pd.DataFrame:
-    path = os.path.join(DATA_DIR, f"{split}_split_L{L}.csv")
+def _split_path(L: int, split: str, dataset: str) -> str:
+    """
+    File path for the train/val/test split CSV.
+
+    dataset = "liar"   -> {split}_split_L{L}.csv          (legacy / default)
+    dataset = "merged" -> merged_{split}_split_L{L}.csv   (joint LIAR+CoAID)
+    """
+    if dataset == "liar":
+        return os.path.join(DATA_DIR, f"{split}_split_L{L}.csv")
+    return os.path.join(DATA_DIR, f"{dataset}_{split}_split_L{L}.csv")
+
+
+def _cache_path(L: int, split: str, dataset: str) -> str:
+    """bert_features_{split}_L{L}.npz for liar; bert_features_merged_{split}_L{L}.npz for merged."""
+    if dataset == "liar":
+        return os.path.join(DATA_DIR, f"bert_features_{split}_L{L}.npz")
+    return os.path.join(DATA_DIR, f"bert_features_{dataset}_{split}_L{L}.npz")
+
+
+def _load_split(L: int, split: str, dataset: str) -> pd.DataFrame:
+    path = _split_path(L, split, dataset)
     df = pd.read_csv(path)
     df["truncated_tokens"] = df["truncated_tokens"].apply(ast.literal_eval)
     return df
 
 
 def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument(
+        "--dataset", choices=["liar", "merged"], default="liar",
+        help="liar = original LIAR splits (default). merged = LIAR+CoAID joint splits "
+             "produced by src/phase1/merge_datasets.py",
+    )
+    ap.add_argument("--L", type=int, nargs="*", default=None,
+                    help="Sequence lengths to process. Default = config.SEQUENCE_LENGTHS")
+    args = ap.parse_args()
+
+    Ls = args.L if args.L else SEQUENCE_LENGTHS
+
     print(f"\nPhase 2 Step 3 — caching frozen {BERT_MODEL_NAME} features")
+    print(f"  dataset:    {args.dataset}")
     print(f"  output dir: {DATA_DIR}")
-    print(f"  L values:   {SEQUENCE_LENGTHS}")
+    print(f"  L values:   {Ls}")
     print(f"  bert_max_len: {BERT_MAX_LEN}\n")
 
-    for L in SEQUENCE_LENGTHS:
+    for L in Ls:
         # We use the same BERT_MAX_LEN regardless of word-truncation L for
         # apples-to-apples comparison across L (subword length is bounded the
         # same way). For L=128 word-truncated input, BERT_MAX_LEN=192 covers
         # the typical 1.3-1.5x subword expansion. For L=256/512, increase
         # BERT_MAX_LEN in config.py if you want full coverage.
         for split in SPLITS:
-            df = _load_split(L, split)
+            df = _load_split(L, split, args.dataset)
 
             word_lists = df["truncated_tokens"].tolist()
             labels = np.array(
@@ -64,7 +97,7 @@ def main():
                 dtype=np.int32,
             )
 
-            cache_path = os.path.join(DATA_DIR, f"bert_features_{split}_L{L}.npz")
+            cache_path = _cache_path(L, split, args.dataset)
 
             cache_features(
                 word_lists=word_lists,
